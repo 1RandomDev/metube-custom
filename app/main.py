@@ -23,6 +23,7 @@ class Config:
         'CREATE_CUSTOM_DIRS': 'true',
         'DELETE_FILE_ON_TRASHCAN': 'false',
         'STATE_DIR': '.',
+        'ARCHIVE_FILE': '',
         'URL_PREFIX': '',
         'OUTPUT_TEMPLATE': '%(title)s.%(ext)s',
         'OUTPUT_TEMPLATE_CHAPTER': '%(title)s - %(section_number)s %(section_title)s.%(ext)s',

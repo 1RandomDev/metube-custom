@@ -29,10 +29,11 @@ class DownloadQueueNotifier:
         raise NotImplementedError
 
 class DownloadInfo:
-    def __init__(self, id, title, url, quality, format, folder, custom_name_prefix, error):
+    def __init__(self, id, title, url, extractor, quality, format, folder, custom_name_prefix, error):
         self.id = id if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
         self.title = title if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
         self.url = url
+        self.extractor = extractor
         self.quality = quality
         self.format = format
         self.folder = folder
@@ -225,7 +226,9 @@ class DownloadQueue:
             'no_color': True,
             'extract_flat': True,
             'ignore_no_formats_error': True,
+            'break_on_existing': True,
             'paths': {"home": self.config.DOWNLOAD_DIR, "temp": self.config.TEMP_DIR},
+            'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE else None),
             **self.config.YTDL_OPTIONS,
         }).extract_info(url, download=False)
 
@@ -282,7 +285,7 @@ class DownloadQueue:
             return {'status': 'ok'}
         elif etype == 'video' or etype.startswith('url') and 'id' in entry and 'title' in entry:
             if not self.queue.exists(entry['id']):
-                dl = DownloadInfo(entry['id'], entry['title'], entry.get('webpage_url') or entry['url'], quality, format, folder, custom_name_prefix, error)
+                dl = DownloadInfo(entry['id'], entry['title'], entry.get('webpage_url') or entry['url'], entry['extractor_key'].lower(), quality, format, folder, custom_name_prefix, error)
                 dldirectory, error_message = self.__calc_download_path(quality, format, folder)
                 if error_message is not None:
                     return error_message
@@ -291,11 +294,15 @@ class DownloadQueue:
                 for property, value in entry.items():
                     if property.startswith("playlist"):
                         output = output.replace(f"%({property})s", str(value))
+                download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, {
+                    'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE else None),
+                    **self.config.YTDL_OPTIONS
+                }, dl)
                 if auto_start is True:
-                    self.queue.put(Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, self.config.YTDL_OPTIONS, dl))
+                    self.queue.put(download)
                     self.event.set()
                 else:
-                    self.pending.put(Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, self.config.YTDL_OPTIONS, dl))
+                    self.pending.put(download)
                 await self.notifier.added(dl)
             return {'status': 'ok'}
         elif etype.startswith('url'):
@@ -312,6 +319,8 @@ class DownloadQueue:
             already.add(url)
         try:
             entry = await asyncio.get_running_loop().run_in_executor(None, self.__extract_info, url)
+        except yt_dlp.utils.ExistingVideoReached as exc:
+            return {'status': 'error', 'msg': 'Already recorded in archive'}
         except yt_dlp.utils.YoutubeDLError as exc:
             return {'status': 'error', 'msg': str(exc)}
         return await self.__add_entry(entry, quality, format, folder, custom_name_prefix, auto_start, already)
@@ -355,6 +364,14 @@ class DownloadQueue:
                     os.remove(os.path.join(dldirectory, dl.info.filename))
                 except Exception as e:
                     log.warn(f'deleting file for download {id} failed with error message {e!r}')
+                if self.config.ARCHIVE_FILE:
+                    with open(self.config.ARCHIVE_FILE, "r+") as file:
+                        data = file.readlines()
+                        file.seek(0)
+                        for line in data:
+                            if line.strip('\n') != dl.info.extractor+' '+dl.info.id:
+                                file.write(line)
+                        file.truncate()
             self.done.delete(id)
             await self.notifier.cleared(id)
         return {'status': 'ok'}
