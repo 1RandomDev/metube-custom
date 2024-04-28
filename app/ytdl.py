@@ -343,12 +343,12 @@ class DownloadQueue:
                 await self.notifier.canceled(id)
         return {'status': 'ok'}
 
-    async def clear(self, ids):
+    async def clear(self, ids, deleteFile):
         for id in ids:
             if not self.done.exists(id):
                 log.warn(f'requested delete for non-existent download {id}')
                 continue
-            if self.config.DELETE_FILE_ON_TRASHCAN:
+            if self.config.DELETE_FILE_ON_TRASHCAN and deleteFile:
                 dl = self.done.get(id)
                 try:
                     dldirectory, _ = self.__calc_download_path(dl.info.quality, dl.info.format, dl.info.folder)

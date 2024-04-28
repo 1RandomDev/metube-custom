@@ -208,12 +208,12 @@ export class AppComponent implements AfterViewInit {
     this.downloads.delById('done', [key]).subscribe();
   }
 
-  delDownload(where: string, id: string) {
-    this.downloads.delById(where, [id]).subscribe();
+  delDownload(where: string, id: string, deleteFile: boolean = false) {
+    this.downloads.delById(where, [id], deleteFile).subscribe();
   }
 
   delSelectedDownloads(where: string) {
-    this.downloads.delByFilter(where, dl => dl.checked).subscribe();
+    this.downloads.delByFilter(where, dl => dl.checked, true).subscribe();
   }
 
   clearCompletedDownloads() {

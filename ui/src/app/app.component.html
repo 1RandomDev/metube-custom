@@ -191,7 +191,7 @@
           <a href="{{download.value.url}}" target="_blank"><fa-icon [icon]="faExternalLinkAlt"></fa-icon></a>
         </td>
         <td>
-          <button type="button" class="btn btn-link" (click)="delDownload('done', download.key)"><fa-icon [icon]="faTrashAlt"></fa-icon></button>
+          <button type="button" class="btn btn-link" (click)="delDownload('done', download.key, true)"><fa-icon [icon]="faTrashAlt"></fa-icon></button>
         </td>
       </tr>
     </tbody>

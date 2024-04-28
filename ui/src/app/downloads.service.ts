@@ -109,14 +109,14 @@ export class DownloadsService {
     return this.http.post('start', {ids: ids});
   }
 
-  public delById(where: string, ids: string[]) {
+  public delById(where: string, ids: string[], deleteFile: boolean = false) {
     ids.forEach(id => this[where].get(id).deleting = true);
-    return this.http.post('delete', {where: where, ids: ids});
+    return this.http.post('delete', {where: where, ids: ids, deleteFile: deleteFile});
   }
 
-  public delByFilter(where: string, filter: (dl: Download) => boolean) {
+  public delByFilter(where: string, filter: (dl: Download) => boolean, deleteFile: boolean = false) {
     let ids: string[] = [];
     this[where].forEach((dl: Download) => { if (filter(dl)) ids.push(dl.url) });
-    return this.delById(where, ids);
+    return this.delById(where, ids, deleteFile);
   }
 }

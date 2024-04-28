@@ -132,7 +132,7 @@ async def delete(request):
     where = post.get('where')
     if not ids or where not in ['queue', 'done']:
         raise web.HTTPBadRequest()
-    status = await (dqueue.cancel(ids) if where == 'queue' else dqueue.clear(ids))
+    status = await (dqueue.cancel(ids) if where == 'queue' else dqueue.clear(ids, post.get('deleteFile')))
     return web.Response(text=serializer.encode(status))
 
 @routes.post(config.URL_PREFIX + 'start')
