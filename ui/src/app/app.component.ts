@@ -56,7 +56,7 @@ export class AppComponent implements AfterViewInit {
     this.setQualities()
     this.quality = cookieService.get('metube_quality') || 'best';
     this.autoStart = cookieService.get('metube_auto_start') !== 'false';
-    this.bypassArchive = cookieService.get('metube_bypass_archive') !== 'false';
+    this.bypassArchive = cookieService.get('metube_bypass_archive') == 'true';
 
     this.activeTheme = this.getPreferredTheme(cookieService);
   }
