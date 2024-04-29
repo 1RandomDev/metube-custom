@@ -67,30 +67,37 @@
           </div>
         </div>
         <div class="col-md-3 add-url-component">
-          <div class="input-group">
-            <span class="input-group-text">Auto Start</span>
-            <select class="form-select" name="autoStart" [(ngModel)]="autoStart" (change)="autoStartChanged()" [disabled]="addInProgress || downloads.loading">
+          <div class="input-group" *ngIf="showBypassArchive()">
+            <span class="input-group-text">Bypass archive</span>
+            <select class="form-select" name="bypassArchive" [(ngModel)]="bypassArchive" (change)="bypassArchiveChanged()" [disabled]="addInProgress || downloads.loading">
               <option [ngValue]="true">Yes</option>
               <option [ngValue]="false">No</option>
             </select>
           </div>
         </div>
         <div class="col-md-3 add-url-component">
-          <div [attr.class]="showAdvanced() ? 'btn-group add-url-group' : 'add-url-group'" ngbDropdown #advancedDropdown="ngbDropdown" display="dynamic" placement="bottom-end">
+          <div class="btn-group add-url-group" ngbDropdown #advancedDropdown="ngbDropdown" display="dynamic" placement="bottom-end">
             <button class="btn btn-primary add-url" type="submit" (click)="addDownload()" [disabled]="addInProgress || downloads.loading">
               <span class="spinner-border spinner-border-sm" role="status" id="add-spinner" *ngIf="addInProgress"></span>
               {{ addInProgress ? "Adding..." : "Add" }}
             </button>
-            <button class="btn btn-primary dropdown-toggle dropdown-toggle-split" id="advancedButton" type="button" title="Advanced options" [disabled]="addInProgress || downloads.loading" ngbDropdownAnchor (click)="advancedDropdown.open()" *ngIf="showAdvanced()">
+            <button class="btn btn-primary dropdown-toggle dropdown-toggle-split" id="advancedButton" type="button" title="Advanced options" [disabled]="addInProgress || downloads.loading" ngbDropdownAnchor (click)="advancedDropdown.open()">
               <span class="sr-only">Advanced options</span>
             </button>
             <div ngbDropdownMenu aria-labelledby="advancedButton" class="dropdown-menu dropdown-menu-end folder-dropdown-menu">
               <div class="container">
-                <div class="input-group add-url-component">
+                <div class="input-group">
+                  <span class="input-group-text">Auto Start</span>
+                  <select class="form-select" name="autoStart" [(ngModel)]="autoStart" (change)="autoStartChanged()" [disabled]="addInProgress || downloads.loading">
+                    <option [ngValue]="true">Yes</option>
+                    <option [ngValue]="false">No</option>
+                  </select>
+                </div>
+                <div class="input-group add-url-component" *ngIf="showCustomDirectory()">
                   <span class="input-group-text">Download Folder</span>
                   <ng-select [items]="customDirs$ | async" placeholder="Default" [addTag]="allowCustomDir.bind(this)" addTagText="Create directory" [ngStyle]="{'flex-grow':'1'}" bindLabel="folder" [(ngModel)]="folder" [disabled]="addInProgress || downloads.loading"></ng-select>
                 </div>
-                <div class="input-group add-url-component">
+                <div class="input-group add-url-component" *ngIf="showCustomDirectory()">
                   <span class="input-group-text">Custom Name Prefix</span>
                   <input type="text" autocomplete="off" spellcheck="false" class="form-control" placeholder="Default" name="customNamePrefix" [(ngModel)]="customNamePrefix" [disabled]="addInProgress || downloads.loading">
                 </div>

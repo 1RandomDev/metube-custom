@@ -24,6 +24,7 @@ export class AppComponent implements AfterViewInit {
   folder: string;
   customNamePrefix: string;
   autoStart: boolean;
+  bypassArchive: boolean;
   addInProgress = false;
   themes: Theme[] = Themes;
   activeTheme: Theme;
@@ -55,6 +56,7 @@ export class AppComponent implements AfterViewInit {
     this.setQualities()
     this.quality = cookieService.get('metube_quality') || 'best';
     this.autoStart = cookieService.get('metube_auto_start') !== 'false';
+    this.bypassArchive = cookieService.get('metube_bypass_archive') !== 'false';
 
     this.activeTheme = this.getPreferredTheme(cookieService);
   }
@@ -101,8 +103,12 @@ export class AppComponent implements AfterViewInit {
     this.downloads.customDirsChanged.next(this.downloads.customDirs);
   }
 
-  showAdvanced() {
+  showCustomDirectory() {
     return this.downloads.configuration['CUSTOM_DIRS'];
+  }
+
+  showBypassArchive() {
+    return !!this.downloads.configuration['ARCHIVE_FILE'];
   }
 
   allowCustomDir(tag: string) {
@@ -164,6 +170,10 @@ export class AppComponent implements AfterViewInit {
     this.cookieService.set('metube_auto_start', this.autoStart ? 'true' : 'false', { expires: 3650 });
   }
 
+  bypassArchiveChanged() {
+    this.cookieService.set('metube_bypass_archive', this.bypassArchive ? 'true' : 'false', { expires: 3650 });
+  }
+
   queueSelectionChanged(checked: number) {
     this.queueDelSelected.nativeElement.disabled = checked == 0;
   }
@@ -179,17 +189,18 @@ export class AppComponent implements AfterViewInit {
     this.quality = exists ? this.quality : 'best'
   }
 
-  addDownload(url?: string, quality?: string, format?: string, folder?: string, customNamePrefix?: string, autoStart?: boolean) {
+  addDownload(url?: string, quality?: string, format?: string, folder?: string, customNamePrefix?: string, autoStart?: boolean, bypassArchive?: boolean) {
     url = url ?? this.addUrl
     quality = quality ?? this.quality
     format = format ?? this.format
     folder = folder ?? this.folder
     customNamePrefix = customNamePrefix ?? this.customNamePrefix
     autoStart = autoStart ?? this.autoStart
+    bypassArchive = bypassArchive ?? this.bypassArchive
 
-    console.debug('Downloading: url='+url+' quality='+quality+' format='+format+' folder='+folder+' customNamePrefix='+customNamePrefix+' autoStart='+autoStart);
+    console.debug('Downloading: url='+url+' quality='+quality+' format='+format+' folder='+folder+' customNamePrefix='+customNamePrefix+' autoStart='+autoStart+' bypassArchive='+bypassArchive);
     this.addInProgress = true;
-    this.downloads.add(url, quality, format, folder, customNamePrefix, autoStart).subscribe((status: Status) => {
+    this.downloads.add(url, quality, format, folder, customNamePrefix, autoStart, bypassArchive).subscribe((status: Status) => {
       if (status.status === 'error') {
         alert(`Error adding URL: ${status.msg}`);
       } else {

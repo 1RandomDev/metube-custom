@@ -119,11 +119,12 @@ async def add(request):
     folder = post.get('folder')
     custom_name_prefix = post.get('custom_name_prefix')
     auto_start = post.get('auto_start')
+    bypass_archive = post.get('bypass_archive')
     if custom_name_prefix is None:
         custom_name_prefix = ''
     if auto_start is None:
         auto_start = True
-    status = await dqueue.add(url, quality, format, folder, custom_name_prefix, auto_start)
+    status = await dqueue.add(url, quality, format, folder, custom_name_prefix, auto_start, bypass_archive)
     return web.Response(text=serializer.encode(status))
 
 @routes.post(config.URL_PREFIX + 'delete')

@@ -220,7 +220,7 @@ class DownloadQueue:
         asyncio.create_task(self.__download())
         asyncio.create_task(self.__import_queue())
 
-    def __extract_info(self, url):
+    def __extract_info(self, url, bypass_archive):
         return yt_dlp.YoutubeDL(params={
             'quiet': True,
             'no_color': True,
@@ -228,7 +228,7 @@ class DownloadQueue:
             'ignore_no_formats_error': True,
             'break_on_existing': True,
             'paths': {"home": self.config.DOWNLOAD_DIR, "temp": self.config.TEMP_DIR},
-            'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE else None),
+            'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE and not bypass_archive else None),
             **self.config.YTDL_OPTIONS,
         }).extract_info(url, download=False)
 
@@ -255,7 +255,7 @@ class DownloadQueue:
             dldirectory = base_directory
         return dldirectory, None
 
-    async def __add_entry(self, entry, quality, format, folder, custom_name_prefix, auto_start, already):
+    async def __add_entry(self, entry, quality, format, folder, custom_name_prefix, auto_start, bypass_archive, already):
         if not entry:
             return {'status': 'error', 'msg': "Invalid/empty data was given."}
 
@@ -279,7 +279,7 @@ class DownloadQueue:
                 for property in ("id", "title", "uploader", "uploader_id"):
                     if property in entry:
                         etr[f"playlist_{property}"] = entry[property]
-                results.append(await self.__add_entry(etr, quality, format, folder, custom_name_prefix, auto_start, already))
+                results.append(await self.__add_entry(etr, quality, format, folder, custom_name_prefix, auto_start, bypass_archive, already))
             if any(res['status'] == 'error' for res in results):
                 return {'status': 'error', 'msg': ', '.join(res['msg'] for res in results if res['status'] == 'error' and 'msg' in res)}
             return {'status': 'ok'}
@@ -295,7 +295,7 @@ class DownloadQueue:
                     if property.startswith("playlist"):
                         output = output.replace(f"%({property})s", str(value))
                 download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, {
-                    'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE else None),
+                    'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE and not bypass_archive else None),
                     **self.config.YTDL_OPTIONS
                 }, dl)
                 if auto_start is True:
@@ -306,10 +306,10 @@ class DownloadQueue:
                 await self.notifier.added(dl)
             return {'status': 'ok'}
         elif etype.startswith('url'):
-            return await self.add(entry['url'], quality, format, folder, custom_name_prefix, auto_start, already)
+            return await self.add(entry['url'], quality, format, folder, custom_name_prefix, auto_start, bypass_archive, already)
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}
 
-    async def add(self, url, quality, format, folder, custom_name_prefix, auto_start=True, already=None):
+    async def add(self, url, quality, format, folder, custom_name_prefix, auto_start=True, bypass_archive=False, already=None):
         log.info(f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=}')
         already = set() if already is None else already
         if url in already:
@@ -318,12 +318,12 @@ class DownloadQueue:
         else:
             already.add(url)
         try:
-            entry = await asyncio.get_running_loop().run_in_executor(None, self.__extract_info, url)
+            entry = await asyncio.get_running_loop().run_in_executor(None, self.__extract_info, url, bypass_archive)
         except yt_dlp.utils.ExistingVideoReached as exc:
             return {'status': 'error', 'msg': 'Already recorded in archive'}
         except yt_dlp.utils.YoutubeDLError as exc:
             return {'status': 'error', 'msg': str(exc)}
-        return await self.__add_entry(entry, quality, format, folder, custom_name_prefix, auto_start, already)
+        return await self.__add_entry(entry, quality, format, folder, custom_name_prefix, auto_start, bypass_archive, already)
 
     async def start_pending(self, ids):
         for id in ids:
