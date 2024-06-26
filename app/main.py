@@ -25,6 +25,8 @@ class Config:
         'STATE_DIR': '.',
         'ARCHIVE_FILE': '',
         'URL_PREFIX': '',
+        'PUBLIC_HOST_URL': 'download/',
+        'PUBLIC_HOST_AUDIO_URL': 'audio_download/',
         'OUTPUT_TEMPLATE': '%(title)s.%(ext)s',
         'OUTPUT_TEMPLATE_CHAPTER': '%(title)s - %(section_number)s %(section_title)s.%(ext)s',
         'YTDL_OPTIONS': '{}',
