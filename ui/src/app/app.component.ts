@@ -25,6 +25,8 @@ export class AppComponent implements AfterViewInit {
   customNamePrefix: string;
   autoStart: boolean;
   bypassArchive: boolean;
+  playlistStrictMode: boolean;
+  playlistItemLimit: number;
   addInProgress = false;
   themes: Theme[] = Themes;
   activeTheme: Theme;
@@ -37,7 +39,6 @@ export class AppComponent implements AfterViewInit {
   @ViewChild('doneClearCompleted') doneClearCompleted: ElementRef;
   @ViewChild('doneClearFailed') doneClearFailed: ElementRef;
   @ViewChild('doneRetryFailed') doneRetryFailed: ElementRef;
-
 
   faTrashAlt = faTrashAlt;
   faCheckCircle = faCheckCircle;
@@ -62,6 +63,7 @@ export class AppComponent implements AfterViewInit {
   }
 
   ngOnInit() {
+    this.getConfiguration();
     this.customDirs$ = this.getMatchingCustomDir();
     this.setTheme(this.activeTheme);
 
@@ -135,6 +137,18 @@ export class AppComponent implements AfterViewInit {
     }));
   }
 
+  getConfiguration() {
+    this.downloads.configurationChanged.subscribe({
+      next: (config) => {
+        this.playlistStrictMode = config['DEFAULT_OPTION_PLAYLIST_STRICT_MODE'];
+        const playlistItemLimit = config['DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT'];
+        if (playlistItemLimit !== '0') {
+          this.playlistItemLimit = playlistItemLimit;
+        }
+      }
+    });
+  }
+
   getPreferredTheme(cookieService: CookieService) {
     let theme = 'auto';
     if (cookieService.check('metube_theme')) {
@@ -189,18 +203,20 @@ export class AppComponent implements AfterViewInit {
     this.quality = exists ? this.quality : 'best'
   }
 
-  addDownload(url?: string, quality?: string, format?: string, folder?: string, customNamePrefix?: string, autoStart?: boolean, bypassArchive?: boolean) {
+  addDownload(url?: string, quality?: string, format?: string, folder?: string, customNamePrefix?: string, playlistStrictMode?: boolean, playlistItemLimit?: number, autoStart?: boolean, bypassArchive?: boolean) {
     url = url ?? this.addUrl
     quality = quality ?? this.quality
     format = format ?? this.format
     folder = folder ?? this.folder
     customNamePrefix = customNamePrefix ?? this.customNamePrefix
+    playlistStrictMode = playlistStrictMode ?? this.playlistStrictMode
+    playlistItemLimit = playlistItemLimit ?? this.playlistItemLimit
     autoStart = autoStart ?? this.autoStart
     bypassArchive = bypassArchive ?? this.bypassArchive
 
-    console.debug('Downloading: url='+url+' quality='+quality+' format='+format+' folder='+folder+' customNamePrefix='+customNamePrefix+' autoStart='+autoStart+' bypassArchive='+bypassArchive);
+    console.debug('Downloading: url='+url+' quality='+quality+' format='+format+' folder='+folder+' customNamePrefix='+customNamePrefix+' playlistStrictMode='+playlistStrictMode+' playlistItemLimit='+playlistItemLimit+' autoStart='+autoStart+' bypassArchive='+bypassArchive);
     this.addInProgress = true;
-    this.downloads.add(url, quality, format, folder, customNamePrefix, autoStart, bypassArchive).subscribe((status: Status) => {
+    this.downloads.add(url, quality, format, folder, customNamePrefix, playlistStrictMode, playlistItemLimit, autoStart, bypassArchive).subscribe((status: Status) => {
       if (status.status === 'error') {
         alert(`Error adding URL: ${status.msg}`);
       } else {
@@ -215,7 +231,7 @@ export class AppComponent implements AfterViewInit {
   }
 
   retryDownload(key: string, download: Download) {
-    this.addDownload(download.url, download.quality, download.format, download.folder, download.custom_name_prefix, true);
+    this.addDownload(download.url, download.quality, download.format, download.folder, download.custom_name_prefix, download.playlist_strict_mode, download.playlist_item_limit, true);
     this.downloads.delById('done', [key]).subscribe();
   }
 
@@ -258,5 +274,12 @@ export class AppComponent implements AfterViewInit {
 
   identifyDownloadRow(index: number, row: KeyValue<string, Download>) {
     return row.key;
+  }
+
+  isNumber(event) {
+    const charCode = (event.which) ? event.which : event.keyCode;
+    if (charCode > 31 && (charCode < 48 || charCode > 57)) {
+      event.preventDefault();
+    }
   }
 }
