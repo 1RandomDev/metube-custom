@@ -17,12 +17,13 @@ button.add-url
 
 .folder-dropdown-menu
     width: 500px
+    max-width: calc(100vw - 3rem)
 
 .folder-dropdown-menu .input-group
     display: flex
     padding-left: 5px
     padding-right: 5px
-.folder-dropdown-menu .input-group-text
+.folder-dropdown-menu .container > .input-group .input-group-text
     width: 181px
 
 .metube-section-header
@@ -50,6 +51,7 @@ th
     border-top: 0
     border-bottom-width: 3px !important
     vertical-align: middle !important
+    white-space: nowrap
 
 td
     vertical-align: middle
@@ -61,3 +63,7 @@ td
 .form-switch
   input
     margin-top: 5px
+
+.download-progressbar
+    width: 12rem
+    margin-left: auto
