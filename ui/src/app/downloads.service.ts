@@ -118,9 +118,38 @@ export class DownloadsService {
     return this.http.post('delete', {where: where, ids: ids, deleteFile: deleteFile});
   }
 
+  public startByFilter(where: string, filter: (dl: Download) => boolean) {
+    let ids: string[] = [];
+    this[where].forEach((dl: Download) => { if (filter(dl)) ids.push(dl.url) });
+    return this.startById(ids);
+  }
+
   public delByFilter(where: string, filter: (dl: Download) => boolean, deleteFile: boolean = false) {
     let ids: string[] = [];
     this[where].forEach((dl: Download) => { if (filter(dl)) ids.push(dl.url) });
     return this.delById(where, ids, deleteFile);
   }
+  public addDownloadByUrl(url: string): Promise<any> {
+    const defaultQuality = 'best';
+    const defaultFormat = 'mp4';
+    const defaultFolder = ''; 
+    const defaultCustomNamePrefix = '';
+    const defaultPlaylistStrictMode = false;
+    const defaultPlaylistItemLimit = 0;
+    const defaultAutoStart = true;
+    const defaultBypassArchive = false;
+    
+    return new Promise((resolve, reject) => {
+      this.add(url, defaultQuality, defaultFormat, defaultFolder, defaultCustomNamePrefix, defaultPlaylistStrictMode, defaultPlaylistItemLimit, defaultAutoStart, defaultBypassArchive)
+        .subscribe(
+          response => resolve(response),
+          error => reject(error)
+        );
+    });
+  }
+  public exportQueueUrls(): string[] {
+    return Array.from(this.queue.values()).map(download => download.url);
+  }
+  
+  
 }

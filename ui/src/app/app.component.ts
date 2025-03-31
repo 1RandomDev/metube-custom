@@ -1,4 +1,5 @@
 import { Component, ViewChild, ElementRef, AfterViewInit } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
 import { faTrashAlt, faCheckCircle, faTimesCircle, IconDefinition } from '@fortawesome/free-regular-svg-icons';
 import { faRedoAlt, faSun, faMoon, faCircleHalfStroke, faCheck, faExternalLinkAlt, faDownload } from '@fortawesome/free-solid-svg-icons';
 import { CookieService } from 'ngx-cookie-service';
@@ -31,14 +32,23 @@ export class AppComponent implements AfterViewInit {
   themes: Theme[] = Themes;
   activeTheme: Theme;
   customDirs$: Observable<string[]>;
+  showBatchPanel: boolean = false; 
+  batchImportModalOpen = false;
+  batchImportText = '';
+  batchImportStatus = '';
+  importInProgress = false;
+  cancelImportFlag = false;
+  versionInfo: string | null = null;
 
   @ViewChild('queueMasterCheckbox') queueMasterCheckbox: MasterCheckboxComponent;
   @ViewChild('queueDelSelected') queueDelSelected: ElementRef;
+  @ViewChild('queueDownloadSelected') queueDownloadSelected: ElementRef;
   @ViewChild('doneMasterCheckbox') doneMasterCheckbox: MasterCheckboxComponent;
   @ViewChild('doneDelSelected') doneDelSelected: ElementRef;
   @ViewChild('doneClearCompleted') doneClearCompleted: ElementRef;
   @ViewChild('doneClearFailed') doneClearFailed: ElementRef;
   @ViewChild('doneRetryFailed') doneRetryFailed: ElementRef;
+  @ViewChild('doneDownloadSelected') doneDownloadSelected: ElementRef;
 
   faTrashAlt = faTrashAlt;
   faCheckCircle = faCheckCircle;
@@ -51,7 +61,7 @@ export class AppComponent implements AfterViewInit {
   faDownload = faDownload;
   faExternalLinkAlt = faExternalLinkAlt;
 
-  constructor(public downloads: DownloadsService, private cookieService: CookieService) {
+  constructor(public downloads: DownloadsService, private cookieService: CookieService, private http: HttpClient) {
     this.format = cookieService.get('metube_format') || 'any';
     // Needs to be set or qualities won't automatically be set
     this.setQualities()
@@ -91,6 +101,7 @@ export class AppComponent implements AfterViewInit {
       this.doneClearFailed.nativeElement.disabled = failed === 0;
       this.doneRetryFailed.nativeElement.disabled = failed === 0;
     });
+    this.fetchVersionInfo();
   }
 
   // workaround to allow fetching of Map values in the order they were inserted
@@ -190,10 +201,12 @@ export class AppComponent implements AfterViewInit {
 
   queueSelectionChanged(checked: number) {
     this.queueDelSelected.nativeElement.disabled = checked == 0;
+    this.queueDownloadSelected.nativeElement.disabled = checked == 0;
   }
 
   doneSelectionChanged(checked: number) {
     this.doneDelSelected.nativeElement.disabled = checked == 0;
+    this.doneDownloadSelected.nativeElement.disabled = checked == 0;
   }
 
   setQualities() {
@@ -239,6 +252,10 @@ export class AppComponent implements AfterViewInit {
     this.downloads.delById(where, [id], deleteFile).subscribe();
   }
 
+  startSelectedDownloads(where: string){
+    this.downloads.startByFilter(where, dl => dl.checked).subscribe();
+  }
+
   delSelectedDownloads(where: string) {
     this.downloads.delByFilter(where, dl => dl.checked, true).subscribe();
   }
@@ -255,6 +272,20 @@ export class AppComponent implements AfterViewInit {
     this.downloads.done.forEach((dl, key) => {
       if (dl.status === 'error') {
         this.retryDownload(key, dl);
+      }
+    });
+  }
+
+  downloadSelectedFiles() {
+    this.downloads.done.forEach((dl, key) => {
+      if (dl.status === 'finished' && dl.checked) {
+        const link = document.createElement('a');
+        link.href = this.buildDownloadLink(dl);
+        link.setAttribute('download', dl.filename);
+        link.setAttribute('target', '_self');
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
       }
     });
   }
@@ -281,5 +312,154 @@ export class AppComponent implements AfterViewInit {
     if (charCode > 31 && (charCode < 48 || charCode > 57)) {
       event.preventDefault();
     }
+  }
+
+  // Toggle inline batch panel (if you want to use an inline panel for export; not used for import modal)
+  toggleBatchPanel(): void {
+    this.showBatchPanel = !this.showBatchPanel;
+  }
+
+  // Open the Batch Import modal
+  openBatchImportModal(): void {
+    this.batchImportModalOpen = true;
+    this.batchImportText = '';
+    this.batchImportStatus = '';
+    this.importInProgress = false;
+    this.cancelImportFlag = false;
+  }
+
+  // Close the Batch Import modal
+  closeBatchImportModal(): void {
+    this.batchImportModalOpen = false;
+  }
+
+  // Start importing URLs from the batch modal textarea
+  startBatchImport(): void {
+    const urls = this.batchImportText
+      .split(/\r?\n/)
+      .map(url => url.trim())
+      .filter(url => url.length > 0);
+    if (urls.length === 0) {
+      alert('No valid URLs found.');
+      return;
+    }
+    this.importInProgress = true;
+    this.cancelImportFlag = false;
+    this.batchImportStatus = `Starting to import ${urls.length} URLs...`;
+    let index = 0;
+    const delayBetween = 1000;
+    const processNext = () => {
+      if (this.cancelImportFlag) {
+        this.batchImportStatus = `Import cancelled after ${index} of ${urls.length} URLs.`;
+        this.importInProgress = false;
+        return;
+      }
+      if (index >= urls.length) {
+        this.batchImportStatus = `Finished importing ${urls.length} URLs.`;
+        this.importInProgress = false;
+        return;
+      }
+      const url = urls[index];
+      this.batchImportStatus = `Importing URL ${index + 1} of ${urls.length}: ${url}`;
+      // Now pass the selected quality, format, folder, etc. to the add() method
+      this.downloads.add(url, this.quality, this.format, this.folder, this.customNamePrefix,
+        this.playlistStrictMode, this.playlistItemLimit, this.autoStart)
+        .subscribe({
+          next: (status: Status) => {
+            if (status.status === 'error') {
+              alert(`Error adding URL ${url}: ${status.msg}`);
+            }
+            index++;
+            setTimeout(processNext, delayBetween);
+          },
+          error: (err) => {
+            console.error(`Error importing URL ${url}:`, err);
+            index++;
+            setTimeout(processNext, delayBetween);
+          }
+        });
+    };
+    processNext();
+  }
+
+  // Cancel the batch import process
+  cancelBatchImport(): void {
+    if (this.importInProgress) {
+      this.cancelImportFlag = true;
+      this.batchImportStatus += ' Cancelling...';
+    }
+  }
+
+  // Export URLs based on filter: 'pending', 'completed', 'failed', or 'all'
+  exportBatchUrls(filter: 'pending' | 'completed' | 'failed' | 'all'): void {
+    let urls: string[];
+    if (filter === 'pending') {
+      urls = Array.from(this.downloads.queue.values()).map(dl => dl.url);
+    } else if (filter === 'completed') {
+      // Only finished downloads in the "done" Map
+      urls = Array.from(this.downloads.done.values()).filter(dl => dl.status === 'finished').map(dl => dl.url);
+    } else if (filter === 'failed') {
+      // Only error downloads from the "done" Map
+      urls = Array.from(this.downloads.done.values()).filter(dl => dl.status === 'error').map(dl => dl.url);
+    } else {
+      // All: pending + both finished and error in done
+      urls = [
+        ...Array.from(this.downloads.queue.values()).map(dl => dl.url),
+        ...Array.from(this.downloads.done.values()).map(dl => dl.url)
+      ];
+    }
+    if (!urls.length) {
+      alert('No URLs found for the selected filter.');
+      return;
+    }
+    const content = urls.join('\n');
+    const blob = new Blob([content], { type: 'text/plain' });
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = 'metube_urls.txt';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(downloadUrl);
+  }
+
+  // Copy URLs to clipboard based on filter: 'pending', 'completed', 'failed', or 'all'
+  copyBatchUrls(filter: 'pending' | 'completed' | 'failed' | 'all'): void {
+    let urls: string[];
+    if (filter === 'pending') {
+      urls = Array.from(this.downloads.queue.values()).map(dl => dl.url);
+    } else if (filter === 'completed') {
+      urls = Array.from(this.downloads.done.values()).filter(dl => dl.status === 'finished').map(dl => dl.url);
+    } else if (filter === 'failed') {
+      urls = Array.from(this.downloads.done.values()).filter(dl => dl.status === 'error').map(dl => dl.url);
+    } else {
+      urls = [
+        ...Array.from(this.downloads.queue.values()).map(dl => dl.url),
+        ...Array.from(this.downloads.done.values()).map(dl => dl.url)
+      ];
+    }
+    if (!urls.length) {
+      alert('No URLs found for the selected filter.');
+      return;
+    }
+    const content = urls.join('\n');
+    navigator.clipboard.writeText(content)
+      .then(() => alert('URLs copied to clipboard.'))
+      .catch(() => alert('Failed to copy URLs.'));
+  }
+
+  fetchVersionInfo(): void {
+    const baseUrl = `${window.location.origin}${window.location.pathname.replace(/\/[^\/]*$/, '/')}`;
+    const versionUrl = `${baseUrl}version`;
+    this.http.get<{ version: string}>(versionUrl)
+      .subscribe({
+        next: (data) => {
+          this.versionInfo = `yt-dlp version: ${data.version}`;
+        },
+        error: () => {
+          this.versionInfo = '';
+        }
+      });
   }
 }
