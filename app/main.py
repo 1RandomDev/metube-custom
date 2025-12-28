@@ -3,13 +3,18 @@
 
 import os
 import sys
+import asyncio
+from pathlib import Path
 from aiohttp import web
+from aiohttp.log import access_logger
 import ssl
 import socket
 import socketio
 import logging
 import json
 import pathlib
+import re
+from watchfiles import DefaultFilter, Change, awatch
 
 from ytdl import DownloadQueueNotifier, DownloadQueue
 from yt_dlp.version import __version__ as yt_dlp_version
@@ -24,6 +29,7 @@ class Config:
         'DOWNLOAD_DIRS_INDEXABLE': 'false',
         'CUSTOM_DIRS': 'true',
         'CREATE_CUSTOM_DIRS': 'true',
+        'CUSTOM_DIRS_EXCLUDE_REGEX': r'(^|/)[.@].*$',
         'DELETE_FILE_ON_TRASHCAN': 'false',
         'STATE_DIR': '.',
         'ARCHIVE_FILE': '',
@@ -47,9 +53,11 @@ class Config:
         'DEFAULT_THEME': 'auto',
         'DOWNLOAD_MODE': 'limited',
         'MAX_CONCURRENT_DOWNLOADS': 3,
+        'LOGLEVEL': 'INFO',
+        'ENABLE_ACCESSLOG': 'false',
     }
 
-    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'DELETE_FILE_ON_TRASHCAN', 'DEFAULT_OPTION_PLAYLIST_STRICT_MODE', 'HTTPS')
+    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'DELETE_FILE_ON_TRASHCAN', 'DEFAULT_OPTION_PLAYLIST_STRICT_MODE', 'HTTPS', 'ENABLE_ACCESSLOG')
 
     def __init__(self):
         for k, v in self._DEFAULTS.items():
@@ -67,35 +75,59 @@ class Config:
         if not self.URL_PREFIX.endswith('/'):
             self.URL_PREFIX += '/'
 
-        try:
-            self.YTDL_OPTIONS = json.loads(self.YTDL_OPTIONS)
-            assert isinstance(self.YTDL_OPTIONS, dict)
-        except (json.decoder.JSONDecodeError, AssertionError):
-            log.error('YTDL_OPTIONS is invalid')
+        # Convert relative addresses to absolute addresses to prevent the failure of file address comparison
+        if self.YTDL_OPTIONS_FILE and self.YTDL_OPTIONS_FILE.startswith('.'):
+            self.YTDL_OPTIONS_FILE = str(Path(self.YTDL_OPTIONS_FILE).resolve())
+
+        success,_ = self.load_ytdl_options()
+        if not success:
             sys.exit(1)
 
-        if self.YTDL_OPTIONS_FILE:
-            log.info(f'Loading yt-dlp custom options from "{self.YTDL_OPTIONS_FILE}"')
-            if not os.path.exists(self.YTDL_OPTIONS_FILE):
-                log.error(f'File "{self.YTDL_OPTIONS_FILE}" not found')
-                sys.exit(1)
-            try:
-                with open(self.YTDL_OPTIONS_FILE) as json_data:
-                    opts = json.load(json_data)
-                assert isinstance(opts, dict)
-            except (json.decoder.JSONDecodeError, AssertionError):
-                log.error('YTDL_OPTIONS_FILE contents is invalid')
-                sys.exit(1)
-            self.YTDL_OPTIONS.update(opts)
+    def load_ytdl_options(self) -> tuple[bool, str]:
+        try:
+            self.YTDL_OPTIONS = json.loads(os.environ.get('YTDL_OPTIONS', '{}'))
+            assert isinstance(self.YTDL_OPTIONS, dict)
+        except (json.decoder.JSONDecodeError, AssertionError):
+            msg = 'Environment variable YTDL_OPTIONS is invalid'
+            log.error(msg)
+            return (False, msg)
+
+        if not self.YTDL_OPTIONS_FILE:
+            return (True, '')
+
+        log.info(f'Loading yt-dlp custom options from "{self.YTDL_OPTIONS_FILE}"')
+        if not os.path.exists(self.YTDL_OPTIONS_FILE):
+            msg = f'File "{self.YTDL_OPTIONS_FILE}" not found'
+            log.error(msg)
+            return (False, msg)
+        try:
+            with open(self.YTDL_OPTIONS_FILE) as json_data:
+                opts = json.load(json_data)
+            assert isinstance(opts, dict)
+        except (json.decoder.JSONDecodeError, AssertionError):
+            msg = 'YTDL_OPTIONS_FILE contents is invalid'
+            log.error(msg)
+            return (False, msg)
+
+        self.YTDL_OPTIONS.update(opts)
+        return (True, '')
 
 config = Config()
 
 class ObjectSerializer(json.JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, object):
+        # First try to use __dict__ for custom objects
+        if hasattr(obj, '__dict__'):
             return obj.__dict__
-        else:
-            return json.JSONEncoder.default(self, obj)
+        # Convert iterables (generators, dict_items, etc.) to lists
+        # Exclude strings and bytes which are also iterable
+        elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
+            try:
+                return list(obj)
+            except:
+                pass
+        # Fall back to default behavior
+        return json.JSONEncoder.default(self, obj)
 
 serializer = ObjectSerializer()
 app = web.Application()
@@ -109,7 +141,7 @@ class Notifier(DownloadQueueNotifier):
         await sio.emit('added', serializer.encode(dl))
 
     async def updated(self, dl):
-        log.info(f"Notifier: Download updated - {dl.title}")
+        log.debug(f"Notifier: Download updated - {dl.title}")
         await sio.emit('updated', serializer.encode(dl))
 
     async def completed(self, dl):
@@ -126,6 +158,55 @@ class Notifier(DownloadQueueNotifier):
 
 dqueue = DownloadQueue(config, Notifier())
 app.on_startup.append(lambda app: dqueue.initialize())
+
+class FileOpsFilter(DefaultFilter):
+    def __call__(self, change_type: int, path: str) -> bool:
+        # Check if this path matches our YTDL_OPTIONS_FILE
+        if path != config.YTDL_OPTIONS_FILE:
+            return False
+
+        # For existing files, use samefile comparison to handle symlinks correctly
+        if os.path.exists(config.YTDL_OPTIONS_FILE):
+            try:
+                if not os.path.samefile(path, config.YTDL_OPTIONS_FILE):
+                    return False
+            except (OSError, IOError):
+                # If samefile fails, fall back to string comparison
+                if path != config.YTDL_OPTIONS_FILE:
+                    return False
+
+        # Accept all change types for our file: modified, added, deleted
+        return change_type in (Change.modified, Change.added, Change.deleted)
+
+def get_options_update_time(success=True, msg=''):
+    result = {
+        'success': success,
+        'msg': msg,
+        'update_time': None
+    }
+
+    # Only try to get file modification time if YTDL_OPTIONS_FILE is set and file exists
+    if config.YTDL_OPTIONS_FILE and os.path.exists(config.YTDL_OPTIONS_FILE):
+        try:
+            result['update_time'] = os.path.getmtime(config.YTDL_OPTIONS_FILE)
+        except (OSError, IOError) as e:
+            log.warning(f"Could not get modification time for {config.YTDL_OPTIONS_FILE}: {e}")
+            result['update_time'] = None
+
+    return result
+
+async def watch_files():
+    async def _watch_files():
+        async for changes in awatch(config.YTDL_OPTIONS_FILE, watch_filter=FileOpsFilter()):
+            success, msg = config.load_ytdl_options()
+            result = get_options_update_time(success, msg)
+            await sio.emit('ytdl_options_changed', serializer.encode(result))
+
+    log.info(f'Starting Watch File: {config.YTDL_OPTIONS_FILE}')
+    asyncio.create_task(_watch_files())
+
+if config.YTDL_OPTIONS_FILE:
+    app.on_startup.append(lambda app: watch_files())
 
 @routes.post(config.URL_PREFIX + 'add')
 async def add(request):
@@ -200,6 +281,8 @@ async def connect(sid, environ):
     await sio.emit('configuration', serializer.encode(config), to=sid)
     if config.CUSTOM_DIRS:
         await sio.emit('custom_dirs', serializer.encode(get_custom_dirs()), to=sid)
+    if config.YTDL_OPTIONS_FILE:
+        await sio.emit('ytdl_options_changed', serializer.encode(get_options_update_time()), to=sid)
 
 def get_custom_dirs():
     def recursive_dirs(base):
@@ -216,8 +299,15 @@ def get_custom_dirs():
 
             return s
 
+        # Include only directories which do not match the exclude filter
+        def include_dir(d):
+            if len(config.CUSTOM_DIRS_EXCLUDE_REGEX) == 0:
+                return True
+            else:
+                return re.search(config.CUSTOM_DIRS_EXCLUDE_REGEX, d) is None
+
         # Recursively lists all subdirectories of DOWNLOAD_DIR
-        dirs = list(filter(None, map(convert, path.glob('**'))))
+        dirs = list(filter(include_dir, map(convert, path.glob('**/'))))
 
         return dirs
 
@@ -234,7 +324,7 @@ def get_custom_dirs():
 
 @routes.get(config.URL_PREFIX)
 def index(request):
-    response = web.FileResponse(os.path.join(config.BASE_DIR, 'ui/dist/metube/index.html'))
+    response = web.FileResponse(os.path.join(config.BASE_DIR, 'ui/dist/metube/browser/index.html'))
     if 'metube_theme' not in request.cookies:
         response.set_cookie('metube_theme', config.DEFAULT_THEME)
     return response
@@ -251,7 +341,10 @@ def robots(request):
 
 @routes.get(config.URL_PREFIX + 'version')
 def version(request):
-    return web.json_response({"version": yt_dlp_version})
+    return web.json_response({
+        "yt-dlp": yt_dlp_version,
+        "version": os.getenv("METUBE_VERSION", "dev")
+    })
 
 if config.URL_PREFIX != '/':
     @routes.get('/')
@@ -264,11 +357,11 @@ if config.URL_PREFIX != '/':
 
 routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
-routes.static(config.URL_PREFIX, os.path.join(config.BASE_DIR, 'ui/dist/metube'))
+routes.static(config.URL_PREFIX, os.path.join(config.BASE_DIR, 'ui/dist/metube/browser'))
 try:
     app.add_routes(routes)
 except ValueError as e:
-    if 'ui/dist/metube' in str(e):
+    if 'ui/dist/metube/browser' in str(e):
         raise RuntimeError('Could not find the frontend UI static assets. Please run `node_modules/.bin/ng build` inside the ui folder') from e
     raise e
 
@@ -295,13 +388,34 @@ def supports_reuse_port():
     except (AttributeError, OSError):
         return False
 
+def parseLogLevel(logLevel):
+    match logLevel:
+        case 'DEBUG':
+            return logging.DEBUG
+        case 'INFO':
+            return logging.INFO
+        case 'WARNING':
+            return logging.WARNING
+        case 'ERROR':
+            return logging.ERROR
+        case 'CRITICAL':
+            return logging.CRITICAL
+        case _:
+            return None
+
+def isAccessLogEnabled():
+    if config.ENABLE_ACCESSLOG:
+        return access_logger
+    else:
+        return None
+
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=parseLogLevel(config.LOGLEVEL))
     log.info(f"Listening on {config.HOST}:{config.PORT}")
 
     if config.HTTPS:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(certfile=config.CERTFILE, keyfile=config.KEYFILE)
-        web.run_app(app, host=config.HOST, port=int(config.PORT), reuse_port=supports_reuse_port(), ssl_context=ssl_context)
+        web.run_app(app, host=config.HOST, port=int(config.PORT), reuse_port=supports_reuse_port(), ssl_context=ssl_context, access_log=isAccessLogEnabled())
     else:
-        web.run_app(app, host=config.HOST, port=int(config.PORT), reuse_port=supports_reuse_port())
+        web.run_app(app, host=config.HOST, port=int(config.PORT), reuse_port=supports_reuse_port(), access_log=isAccessLogEnabled())

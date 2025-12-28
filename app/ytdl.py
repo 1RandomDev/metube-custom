@@ -7,12 +7,24 @@ import asyncio
 import multiprocessing
 import logging
 import re
+import types
 
 import yt_dlp.networking.impersonate
 from dl_formats import get_format, get_opts, AUDIO_FORMATS
 from datetime import datetime
 
 log = logging.getLogger('ytdl')
+
+def _convert_generators_to_lists(obj):
+    """Recursively convert generators to lists in a dictionary to make it pickleable."""
+    if isinstance(obj, types.GeneratorType):
+        return list(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_generators_to_lists(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_convert_generators_to_lists(item) for item in obj)
+    else:
+        return obj
 
 class DownloadQueueNotifier:
     async def added(self, dl):
@@ -31,7 +43,7 @@ class DownloadQueueNotifier:
         raise NotImplementedError
 
 class DownloadInfo:
-    def __init__(self, id, title, url, extractor, quality, format, folder, custom_name_prefix, error):
+    def __init__(self, id, title, url, extractor, quality, format, folder, custom_name_prefix, error, entry, playlist_item_limit):
         self.id = id if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
         self.title = title if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
         self.url = url
@@ -45,6 +57,9 @@ class DownloadInfo:
         self.size = None
         self.timestamp = time.time_ns()
         self.error = error
+        # Convert generators to lists to make entry pickleable
+        self.entry = _convert_generators_to_lists(entry) if entry is not None else None
+        self.playlist_item_limit = playlist_item_limit
 
 class Download:
     manager = None
@@ -56,6 +71,8 @@ class Download:
         self.output_template_chapter = output_template_chapter
         self.format = get_format(format, quality)
         self.ytdl_opts = get_opts(format, quality, ytdl_opts)
+        if "impersonate" in self.ytdl_opts:
+            self.ytdl_opts["impersonate"] = yt_dlp.networking.impersonate.ImpersonateTarget.from_str(self.ytdl_opts["impersonate"])
         self.info = info
         self.canceled = False
         self.tmpfilename = None
@@ -171,7 +188,7 @@ class Download:
                     self.info.percent = status['downloaded_bytes'] / total * 100
             self.info.speed = status.get('speed')
             self.info.eta = status.get('eta')
-            log.info(f"Updating status for {self.info.title}: {status}")
+            log.debug(f"Updating status for {self.info.title}: {status}")
             await self.notifier.updated(self.info)
 
 class PersistentQueue:
@@ -239,11 +256,16 @@ class DownloadQueue:
 
     async def __import_queue(self):
         for k, v in self.queue.saved_items():
-            await self.add(v.url, v.quality, v.format, v.folder, v.custom_name_prefix, getattr(v, 'playlist_strict_mode', False), getattr(v, 'playlist_item_limit', 0))
+            await self.__add_download(v, True)
+
+    async def __import_pending(self):
+        for k, v in self.pending.saved_items():
+            await self.__add_download(v, False)
 
     async def initialize(self):
         log.info("Initializing DownloadQueue")
         asyncio.create_task(self.__import_queue())
+        asyncio.create_task(self.__import_pending())
 
     async def __start_download(self, download):
         if download.canceled:
@@ -302,8 +324,8 @@ class DownloadQueue:
             'noplaylist': playlist_strict_mode,
             'paths': {"home": self.config.DOWNLOAD_DIR, "temp": self.config.TEMP_DIR},
             'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE and not bypass_archive else None),
-            **({'impersonate': yt_dlp.networking.impersonate.ImpersonateTarget.from_str(self.config.YTDL_OPTIONS['impersonate'])} if 'impersonate' in self.config.YTDL_OPTIONS else {}),
             **self.config.YTDL_OPTIONS,
+            **({'impersonate': yt_dlp.networking.impersonate.ImpersonateTarget.from_str(self.config.YTDL_OPTIONS['impersonate'])} if 'impersonate' in self.config.YTDL_OPTIONS else {}),
         }).extract_info(url, download=False)
 
     def __calc_download_path(self, quality, format, folder):
@@ -322,6 +344,34 @@ class DownloadQueue:
         else:
             dldirectory = base_directory
         return dldirectory, None
+
+    async def __add_download(self, dl, auto_start):
+        dldirectory, error_message = self.__calc_download_path(dl.quality, dl.format, dl.folder)
+        if error_message is not None:
+            return error_message
+        output = self.config.OUTPUT_TEMPLATE if len(dl.custom_name_prefix) == 0 else f'{dl.custom_name_prefix}.{self.config.OUTPUT_TEMPLATE}'
+        output_chapter = self.config.OUTPUT_TEMPLATE_CHAPTER
+        entry = getattr(dl, 'entry', None)
+        if entry is not None and 'playlist' in entry and entry['playlist'] is not None:
+            if len(self.config.OUTPUT_TEMPLATE_PLAYLIST):
+                output = self.config.OUTPUT_TEMPLATE_PLAYLIST
+            for property, value in entry.items():
+                if property.startswith("playlist"):
+                    output = output.replace(f"%({property})s", str(value))
+        ytdl_options = dict(self.config.YTDL_OPTIONS)
+        if(self.config.ARCHIVE_FILE and not bypass_archive):
+            ytdl_options['download_archive'] = self.config.ARCHIVE_FILE
+        playlist_item_limit = getattr(dl, 'playlist_item_limit', 0)
+        if playlist_item_limit > 0:
+            log.info(f'playlist limit is set. Processing only first {playlist_item_limit} entries')
+            ytdl_options['playlistend'] = playlist_item_limit
+        download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, dl.quality, dl.format, ytdl_options, dl)
+        if auto_start is True:
+            self.queue.put(download)
+            asyncio.create_task(self.__start_download(download))
+        else:
+            self.pending.put(download)
+        await self.notifier.added(dl)
 
     async def __add_entry(self, entry, quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start, bypass_archive, already):
         if not entry:
@@ -343,6 +393,9 @@ class DownloadQueue:
         elif etype == 'playlist':
             log.debug('Processing as a playlist')
             entries = entry['entries']
+            # Convert generator to list if needed (for len() and slicing operations)
+            if isinstance(entries, types.GeneratorType):
+                entries = list(entries)
             log.info(f'playlist detected with {len(entries)} entries')
             playlist_index_digits = len(str(len(entries)))
             results = []
@@ -364,38 +417,13 @@ class DownloadQueue:
             log.debug('Processing as a video')
             key = entry.get('webpage_url') or entry['url']
             if not self.queue.exists(key):
-                dl = DownloadInfo(entry['id'], entry.get('title') or entry['id'], key, entry['extractor_key'].lower(), quality, format, folder, custom_name_prefix, error)
-                dldirectory, error_message = self.__calc_download_path(quality, format, folder)
-                if error_message is not None:
-                    return error_message
-                output = self.config.OUTPUT_TEMPLATE if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{self.config.OUTPUT_TEMPLATE}'
-                output_chapter = self.config.OUTPUT_TEMPLATE_CHAPTER
-                if 'playlist' in entry and entry['playlist'] is not None:
-                    if len(self.config.OUTPUT_TEMPLATE_PLAYLIST):
-                        output = self.config.OUTPUT_TEMPLATE_PLAYLIST
-                    for property, value in entry.items():
-                        if property.startswith("playlist"):
-                            output = output.replace(f"%({property})s", str(value))
-                ytdl_options = dict(self.config.YTDL_OPTIONS)
-                if(self.config.ARCHIVE_FILE and not bypass_archive):
-                    ytdl_options['download_archive'] = self.config.ARCHIVE_FILE
-
-                if playlist_item_limit > 0:
-                    log.info(f'playlist limit is set. Processing only first {playlist_item_limit} entries')
-                    ytdl_options['playlistend'] = playlist_item_limit
-
-                if auto_start is True:
-                    download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, ytdl_options, dl)
-                    self.queue.put(download)
-                    asyncio.create_task(self.__start_download(download))
-                else:
-                    self.pending.put(Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, ytdl_options, dl))
-                await self.notifier.added(dl)
+                dl = DownloadInfo(entry['id'], entry.get('title') or entry['id'], key, entry['extractor_key'].lower(), quality, format, folder, custom_name_prefix, error, entry, playlist_item_limit)
+                await self.__add_download(dl, auto_start)
             return {'status': 'ok'}
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}
-    
+
     async def add(self, url, quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start=True, bypass_archive=False, already=None):
-        log.info(f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=} {playlist_strict_mode=} {playlist_item_limit=}')
+        log.info(f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=} {playlist_strict_mode=} {playlist_item_limit=} {auto_start=} {bypass_archive=}')
         already = set() if already is None else already
         if url in already:
             log.info('recursion detected, skipping')
