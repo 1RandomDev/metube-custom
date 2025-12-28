@@ -113,7 +113,7 @@
 
       <!-- Options Row -->
       <div class="row mb-3 g-3">
-        <div class="col-md-4">
+        <div class="col-md-3">
           <div class="input-group">
             <span class="input-group-text">Quality</span>
             <select class="form-select"
@@ -127,7 +127,7 @@
             </select>
           </div>
         </div>
-        <div class="col-md-4">
+        <div class="col-md-3">
           <div class="input-group">
             <span class="input-group-text">Format</span>
             <select class="form-select"
@@ -141,7 +141,20 @@
             </select>
           </div>
         </div>
-        <div class="col-md-4">
+        <div class="col-md-3">
+          <div class="input-group">
+            <span class="input-group-text">Bypass Archive</span>
+            <select class="form-select"
+              name="bypassArchive"
+              [(ngModel)]="bypassArchive"
+              (change)="bypassArchiveChanged()"
+              [disabled]="addInProgress || downloads.loading">
+              <option [ngValue]="true">Yes</option>
+              <option [ngValue]="false">No</option>
+            </select>
+          </div>
+        </div>
+        <div class="col-md-3">
           <button type="button"
             class="btn btn-outline-secondary w-100 h-100"
             (click)="toggleAdvanced()">
@@ -421,7 +434,7 @@
                   <a href="{{buildDownloadLink(download.value)}}" download class="btn btn-link"><fa-icon [icon]="faDownload" /></a>
                 }
                 <a href="{{download.value.url}}" target="_blank" class="btn btn-link"><fa-icon [icon]="faExternalLinkAlt" /></a>
-                <button type="button" class="btn btn-link" (click)="delDownload('done', download.key)"><fa-icon [icon]="faTrashAlt" /></button>
+                <button type="button" class="btn btn-link" (click)="delDownload('done', download.key, true)"><fa-icon [icon]="faTrashAlt" /></button>
               </div>
             </td>
           </tr>

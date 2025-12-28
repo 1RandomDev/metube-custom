@@ -169,14 +169,6 @@ export class App implements AfterViewInit, OnInit {
     this.downloads.customDirsChanged.next(this.downloads.customDirs);
   }
 
-  showCustomDirectory() {
-    return this.downloads.configuration['CUSTOM_DIRS'];
-  }
-
-  showBypassArchive() {
-    return !!this.downloads.configuration['ARCHIVE_FILE'];
-  }
-
   allowCustomDir(tag: string) {
     if (this.downloads.configuration['CREATE_CUSTOM_DIRS']) {
       return tag;

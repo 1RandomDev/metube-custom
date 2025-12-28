@@ -256,11 +256,11 @@ class DownloadQueue:
 
     async def __import_queue(self):
         for k, v in self.queue.saved_items():
-            await self.__add_download(v, True)
+            await self.__add_download(v, True, False)
 
     async def __import_pending(self):
         for k, v in self.pending.saved_items():
-            await self.__add_download(v, False)
+            await self.__add_download(v, False, False)
 
     async def initialize(self):
         log.info("Initializing DownloadQueue")
@@ -345,7 +345,7 @@ class DownloadQueue:
             dldirectory = base_directory
         return dldirectory, None
 
-    async def __add_download(self, dl, auto_start):
+    async def __add_download(self, dl, auto_start, bypass_archive):
         dldirectory, error_message = self.__calc_download_path(dl.quality, dl.format, dl.folder)
         if error_message is not None:
             return error_message
@@ -418,7 +418,7 @@ class DownloadQueue:
             key = entry.get('webpage_url') or entry['url']
             if not self.queue.exists(key):
                 dl = DownloadInfo(entry['id'], entry.get('title') or entry['id'], key, entry['extractor_key'].lower(), quality, format, folder, custom_name_prefix, error, entry, playlist_item_limit)
-                await self.__add_download(dl, auto_start)
+                await self.__add_download(dl, auto_start, bypass_archive)
             return {'status': 'ok'}
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}
 

@@ -30,9 +30,9 @@ ENV UID=1000
 ENV GID=1000
 ENV UMASK=022
 
-ENV DOWNLOAD_DIR /downloads
-ENV STATE_DIR /downloads/.metube
-ENV TEMP_DIR /downloads
+ENV DOWNLOAD_DIR=/downloads
+ENV STATE_DIR=/downloads/.metube
+ENV TEMP_DIR=/downloads
 VOLUME /downloads
 EXPOSE 8081
 
