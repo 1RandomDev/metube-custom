@@ -389,7 +389,7 @@ class DownloadQueue:
                     self.queue.put(download)
                     asyncio.create_task(self.__start_download(download))
                 else:
-                    self.pending.put(download)
+                    self.pending.put(Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, ytdl_options, dl))
                 await self.notifier.added(dl)
             return {'status': 'ok'}
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}
