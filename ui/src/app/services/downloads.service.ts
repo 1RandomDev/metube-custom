@@ -107,8 +107,8 @@ export class DownloadsService {
     return of({status: 'error', msg: msg})
   }
 
-  public add(url: string, quality: string, format: string, folder: string, customNamePrefix: string, playlistStrictMode: boolean, playlistItemLimit: number, autoStart: boolean, bypassArchive: boolean) {
-    return this.http.post<Status>('add', {url: url, quality: quality, format: format, folder: folder, custom_name_prefix: customNamePrefix, playlist_strict_mode: playlistStrictMode, playlist_item_limit: playlistItemLimit, auto_start: autoStart, bypass_archive: bypassArchive}).pipe(
+  public add(url: string, quality: string, format: string, folder: string, customNamePrefix: string, playlistStrictMode: boolean, playlistItemLimit: number, autoStart: boolean, bypassArchive: boolean, splitByChapters: boolean, chapterTemplate: string) {
+    return this.http.post<Status>('add', { url: url, quality: quality, format: format, folder: folder, custom_name_prefix: customNamePrefix, playlist_strict_mode: playlistStrictMode, playlist_item_limit: playlistItemLimit, auto_start: autoStart, bypass_archive: bypassArchive, split_by_chapters: splitByChapters, chapter_template: chapterTemplate }).pipe(
       catchError(this.handleHTTPError)
     );
   }
@@ -151,9 +151,11 @@ export class DownloadsService {
     const defaultPlaylistItemLimit = 0;
     const defaultAutoStart = true;
     const defaultBypassArchive = false;
-    
+    const defaultSplitByChapters = false;
+    const defaultChapterTemplate = this.configuration['OUTPUT_TEMPLATE_CHAPTER'];
+
     return new Promise((resolve, reject) => {
-      this.add(url, defaultQuality, defaultFormat, defaultFolder, defaultCustomNamePrefix, defaultPlaylistStrictMode, defaultPlaylistItemLimit, defaultAutoStart, defaultBypassArchive)
+      this.add(url, defaultQuality, defaultFormat, defaultFolder, defaultCustomNamePrefix, defaultPlaylistStrictMode, defaultPlaylistItemLimit, defaultAutoStart, defaultBypassArchive, defaultSplitByChapters, defaultChapterTemplate)
         .subscribe({
           next: (response) => resolve(response),
           error: (error) => reject(error)
