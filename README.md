@@ -280,7 +280,7 @@ cd ..
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 # run
-uv run python3 app/main.py
+uv run --env-file=.env python3 app/main.py
 ```
 
 A Docker image can be built locally (it will build the UI too):
