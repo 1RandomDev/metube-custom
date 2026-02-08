@@ -1,4 +1,5 @@
 import os
+import shutil
 import yt_dlp
 from collections import OrderedDict
 import shelve
@@ -8,6 +9,8 @@ import multiprocessing
 import logging
 import re
 import types
+import dbm
+import subprocess
 
 import yt_dlp.networking.impersonate
 from dl_formats import get_format, get_opts, AUDIO_FORMATS
@@ -107,7 +110,7 @@ class Download:
                     else:
                         filename = d['info_dict']['filepath']
                     self.status_queue.put({'status': 'finished', 'filename': filename})
-                
+
                 # Capture all chapter files when SplitChapters finishes
                 elif d.get('postprocessor') == 'SplitChapters' and d.get('status') == 'finished':
                     chapters = d.get('info_dict', {}).get('chapters', [])
@@ -132,7 +135,7 @@ class Download:
                 'postprocessor_hooks': [put_status_postprocessor],
                 **self.ytdl_opts,
             }
-            
+
             # Add chapter splitting options if enabled
             if self.info.split_by_chapters:
                 ytdl_params['outtmpl']['chapter'] = self.info.chapter_template
@@ -142,7 +145,7 @@ class Download:
                     'key': 'FFmpegSplitChapters',
                     'force_keyframes': False
                 })
-            
+
             ret = yt_dlp.YoutubeDL(params=ytdl_params).download([self.info.url])
             self.status_queue.put({'status': 'finished' if ret == 0 else 'error'})
             log.info(f"Finished download for: {self.info.title}")
@@ -209,7 +212,7 @@ class Download:
                     self.info.filename = re.sub(r'\.webm$', '.jpg', self.info.filename)
 
             # Handle chapter files
-            log.debug(f"Update status for {self.info.title}: {status}") 
+            log.debug(f"Update status for {self.info.title}: {status}")
             if 'chapter_file' in status:
                 chapter_file = status.get('chapter_file')
                 if not hasattr(self.info, 'chapter_files'):
@@ -222,7 +225,7 @@ class Download:
                     self.info.chapter_files.append({'filename': rel_path, 'size': file_size})
                 # Skip the rest of status processing for chapter files
                 continue
-            
+
             self.info.status = status['status']
             self.info.msg = status.get('msg')
             if 'downloaded_bytes' in status:
@@ -235,13 +238,16 @@ class Download:
             await self.notifier.updated(self.info)
 
 class PersistentQueue:
-    def __init__(self, path):
+    def __init__(self, name, path):
+        self.identifier = name
         pdir = os.path.dirname(path)
         if not os.path.isdir(pdir):
             os.mkdir(pdir)
         with shelve.open(path, 'c'):
             pass
+
         self.path = path
+        self.repair()
         self.dict = OrderedDict()
 
     def load(self):
@@ -280,21 +286,86 @@ class PersistentQueue:
     def empty(self):
         return not bool(self.dict)
 
+    def repair(self):
+        # check DB format
+        type_check = subprocess.run(
+            ["file", self.path],
+            capture_output=True,
+            text=True
+        )
+        db_type = type_check.stdout.lower()
+
+        # create backup (<queue>.old)
+        try:
+            shutil.copy2(self.path, f"{self.path}.old")
+        except Exception as e:
+            # if we cannot backup then its not safe to attempt a repair
+            #  since it could be due to a filesystem error
+            log.debug(f"PersistentQueue:{self.identifier} backup failed, skipping repair")
+            return
+
+        if "gnu dbm" in db_type:
+            # perform gdbm repair
+            log_prefix = f"PersistentQueue:{self.identifier} repair (dbm/file)"
+            log.debug(f"{log_prefix} started")
+            try:
+                result = subprocess.run(
+                    ["gdbmtool", self.path],
+                    input="recover verbose summary\n",
+                    text=True,
+                    capture_output=True,
+                    timeout=60
+                )
+                log.debug(f"{log_prefix} {result.stdout}")
+                if result.stderr:
+                    log.debug(f"{log_prefix} failed: {result.stderr}")
+            except FileNotFoundError:
+                log.debug(f"{log_prefix} failed: 'gdbmtool' was not found")
+
+            # perform null key cleanup
+            log_prefix = f"PersistentQueue:{self.identifier} repair (null keys)"
+            log.debug(f"{log_prefix} started")
+            deleted = 0
+            try:
+                with dbm.open(self.path, "w") as db:
+                    for key in list(db.keys()):
+                        if len(key) > 0 and all(b == 0x00 for b in key):
+                            log.debug(f"{log_prefix} deleting key of length {len(key)} (all NUL bytes)")
+                            del db[key]
+                            deleted += 1
+                log.debug(f"{log_prefix} done - deleted {deleted} key(s)")
+            except dbm.error:
+                log.debug(f"{log_prefix} failed: db type is dbm.gnu, but the module is not available (dbm.error; module support may be missing or the file may be corrupted)")
+
+        elif "sqlite" in db_type:
+            # perform sqlite3 recovery
+            log_prefix = f"PersistentQueue:{self.identifier} repair (sqlite3/file)"
+            log.debug(f"{log_prefix} started")
+            try:
+                result = subprocess.run(
+                    f"sqlite3 {self.path} '.recover' | sqlite3 {self.path}.tmp",
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                    timeout=60
+                )
+                if result.stderr:
+                    log.debug(f"{log_prefix} failed: {result.stderr}")
+                else:
+                    shutil.move(f"{self.path}.tmp", self.path)
+                    log.debug(f"{log_prefix}{result.stdout or " was successful, no output"}")
+            except FileNotFoundError:
+                log.debug(f"{log_prefix} failed: 'sqlite3' was not found")
+
 class DownloadQueue:
     def __init__(self, config, notifier):
         self.config = config
         self.notifier = notifier
-        self.queue = PersistentQueue(self.config.STATE_DIR + '/queue')
-        self.done = PersistentQueue(self.config.STATE_DIR + '/completed')
-        self.pending = PersistentQueue(self.config.STATE_DIR + '/pending')
+        self.queue = PersistentQueue("queue", self.config.STATE_DIR + '/queue')
+        self.done = PersistentQueue("completed", self.config.STATE_DIR + '/completed')
+        self.pending = PersistentQueue("pending", self.config.STATE_DIR + '/pending')
         self.active_downloads = set()
-        self.semaphore = None
-        # For sequential mode, use an asyncio lock to ensure one-at-a-time execution.
-        if self.config.DOWNLOAD_MODE == 'sequential':
-            self.seq_lock = asyncio.Lock()
-        elif self.config.DOWNLOAD_MODE == 'limited':
-            self.semaphore = asyncio.Semaphore(int(self.config.MAX_CONCURRENT_DOWNLOADS))
-        
+        self.semaphore = asyncio.Semaphore(int(self.config.MAX_CONCURRENT_DOWNLOADS))
         self.done.load()
 
     async def __import_queue(self):
@@ -314,31 +385,12 @@ class DownloadQueue:
         if download.canceled:
             log.info(f"Download {download.info.title} was canceled, skipping start.")
             return
-        if self.config.DOWNLOAD_MODE == 'sequential':
-            async with self.seq_lock:
-                log.info("Starting sequential download.")
-                await download.start(self.notifier)
-                self._post_download_cleanup(download)
-        elif self.config.DOWNLOAD_MODE == 'limited' and self.semaphore is not None:
-            await self.__limited_concurrent_download(download)
-        else:
-            await self.__concurrent_download(download)
-
-    async def __concurrent_download(self, download):
-        log.info("Starting concurrent download without limits.")
-        asyncio.create_task(self._run_download(download))
-
-    async def __limited_concurrent_download(self, download):
-        log.info("Starting limited concurrent download.")
         async with self.semaphore:
-            await self._run_download(download)
-
-    async def _run_download(self, download):
-        if download.canceled:
-            log.info(f"Download {download.info.title} is canceled; skipping start.")
-            return
-        await download.start(self.notifier)
-        self._post_download_cleanup(download)
+            if download.canceled:
+                log.info(f"Download {download.info.title} was canceled, skipping start.")
+                return
+            await download.start(self.notifier)
+            self._post_download_cleanup(download)
 
     def _post_download_cleanup(self, download):
         if download.info.status != 'finished':
@@ -357,7 +409,7 @@ class DownloadQueue:
                 self.done.put(download)
                 asyncio.create_task(self.notifier.completed(download.info))
 
-    def __extract_info(self, url, playlist_strict_mode, bypass_archive):
+    def __extract_info(self, url, bypass_archive):
         debug_logging = logging.getLogger().isEnabledFor(logging.DEBUG)
         return yt_dlp.YoutubeDL(params={
             'quiet': not debug_logging,
@@ -366,7 +418,7 @@ class DownloadQueue:
             'extract_flat': True,
             'ignore_no_formats_error': True,
             'break_on_existing': True,
-            'noplaylist': playlist_strict_mode,
+            'noplaylist': True,
             'paths': {"home": self.config.DOWNLOAD_DIR, "temp": self.config.TEMP_DIR},
             'download_archive': (self.config.ARCHIVE_FILE if self.config.ARCHIVE_FILE and not bypass_archive else None),
             **self.config.YTDL_OPTIONS,
@@ -397,11 +449,17 @@ class DownloadQueue:
         output = self.config.OUTPUT_TEMPLATE if len(dl.custom_name_prefix) == 0 else f'{dl.custom_name_prefix}.{self.config.OUTPUT_TEMPLATE}'
         output_chapter = self.config.OUTPUT_TEMPLATE_CHAPTER
         entry = getattr(dl, 'entry', None)
-        if entry is not None and 'playlist' in entry and entry['playlist'] is not None:
+        if entry is not None and entry.get('playlist_index') is not None:
             if len(self.config.OUTPUT_TEMPLATE_PLAYLIST):
                 output = self.config.OUTPUT_TEMPLATE_PLAYLIST
             for property, value in entry.items():
                 if property.startswith("playlist"):
+                    output = output.replace(f"%({property})s", str(value))
+        if entry is not None and entry.get('channel_index') is not None:
+            if len(self.config.OUTPUT_TEMPLATE_CHANNEL):
+                output = self.config.OUTPUT_TEMPLATE_CHANNEL
+            for property, value in entry.items():
+                if property.startswith("channel"):
                     output = output.replace(f"%({property})s", str(value))
         ytdl_options = dict(self.config.YTDL_OPTIONS)
         if(self.config.ARCHIVE_FILE and not bypass_archive):
@@ -418,7 +476,7 @@ class DownloadQueue:
             self.pending.put(download)
         await self.notifier.added(dl)
 
-    async def __add_entry(self, entry, quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already):
+    async def __add_entry(self, entry, quality, format, folder, custom_name_prefix, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already):
         if not entry:
             return {'status': 'error', 'msg': "Invalid/empty data was given."}
 
@@ -433,28 +491,28 @@ class DownloadQueue:
         etype = entry.get('_type') or 'video'
 
         if etype.startswith('url'):
-            log.debug('Processing as an url')
-            return await self.add(entry['url'], quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already)
-        elif etype == 'playlist':
-            log.debug('Processing as a playlist')
+            log.debug('Processing as a url')
+            return await self.add(entry['url'], quality, format, folder, custom_name_prefix, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already)
+        elif etype == 'playlist' or etype == 'channel':
+            log.debug(f'Processing as a {etype}')
             entries = entry['entries']
             # Convert generator to list if needed (for len() and slicing operations)
             if isinstance(entries, types.GeneratorType):
                 entries = list(entries)
-            log.info(f'playlist detected with {len(entries)} entries')
-            playlist_index_digits = len(str(len(entries)))
+            log.info(f'{etype} detected with {len(entries)} entries')
+            index_digits = len(str(len(entries)))
             results = []
             if playlist_item_limit > 0:
-                log.info(f'Playlist item limit is set. Processing only first {playlist_item_limit} entries')
+                log.info(f'Item limit is set. Processing only first {playlist_item_limit} entries')
                 entries = entries[:playlist_item_limit]
             for index, etr in enumerate(entries, start=1):
                 etr["_type"] = "video"
-                etr["playlist"] = entry["id"]
-                etr["playlist_index"] = '{{0:0{0:d}d}}'.format(playlist_index_digits).format(index)
+                etr[etype] = entry.get("id") or entry.get("channel_id") or entry.get("channel")
+                etr[f"{etype}_index"] = '{{0:0{0:d}d}}'.format(index_digits).format(index)
                 for property in ("id", "title", "uploader", "uploader_id"):
                     if property in entry:
-                        etr[f"playlist_{property}"] = entry[property]
-                results.append(await self.__add_entry(etr, quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already))
+                        etr[f"{etype}_{property}"] = entry[property]
+                results.append(await self.__add_entry(etr, quality, format, folder, custom_name_prefix, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already))
             if any(res['status'] == 'error' for res in results):
                 return {'status': 'error', 'msg': ', '.join(res['msg'] for res in results if res['status'] == 'error' and 'msg' in res)}
             return {'status': 'ok'}
@@ -467,8 +525,8 @@ class DownloadQueue:
             return {'status': 'ok'}
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}
 
-    async def add(self, url, quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start=True, bypass_archive=False, split_by_chapters=False, chapter_template=None, already=None):
-        log.info(f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=} {playlist_strict_mode=} {playlist_item_limit=} {auto_start=} {bypass_archive=} {split_by_chapters=} {chapter_template=}')
+    async def add(self, url, quality, format, folder, custom_name_prefix, playlist_item_limit, auto_start=True, bypass_archive=False, split_by_chapters=False, chapter_template=None, already=None):
+        log.info(f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=} {playlist_item_limit=} {auto_start=} {bypass_archive=} {split_by_chapters=} {chapter_template=}')
         already = set() if already is None else already
         if url in already:
             log.info('recursion detected, skipping')
@@ -476,12 +534,12 @@ class DownloadQueue:
         else:
             already.add(url)
         try:
-            entry = await asyncio.get_running_loop().run_in_executor(None, self.__extract_info, url, playlist_strict_mode, bypass_archive)
+            entry = await asyncio.get_running_loop().run_in_executor(None, self.__extract_info, url, bypass_archive)
         except yt_dlp.utils.ExistingVideoReached as exc:
             return {'status': 'error', 'msg': 'Already recorded in archive'}
         except yt_dlp.utils.YoutubeDLError as exc:
             return {'status': 'error', 'msg': str(exc)}
-        return await self.__add_entry(entry, quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already)
+        return await self.__add_entry(entry, quality, format, folder, custom_name_prefix, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template, already)
 
     async def start_pending(self, ids):
         for id in ids:

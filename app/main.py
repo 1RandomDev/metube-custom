@@ -59,7 +59,7 @@ class Config:
         'OUTPUT_TEMPLATE': '%(title)s.%(ext)s',
         'OUTPUT_TEMPLATE_CHAPTER': '%(title)s - %(section_number)02d - %(section_title)s.%(ext)s',
         'OUTPUT_TEMPLATE_PLAYLIST': '%(playlist_title)s/%(title)s.%(ext)s',
-        'DEFAULT_OPTION_PLAYLIST_STRICT_MODE' : 'false',
+        'OUTPUT_TEMPLATE_CHANNEL': '%(channel)s/%(title)s.%(ext)s',
         'DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT' : '0',
         'YTDL_OPTIONS': '{}',
         'YTDL_OPTIONS_FILE': '',
@@ -71,13 +71,12 @@ class Config:
         'KEYFILE': '',
         'BASE_DIR': '',
         'DEFAULT_THEME': 'auto',
-        'DOWNLOAD_MODE': 'limited',
         'MAX_CONCURRENT_DOWNLOADS': 3,
         'LOGLEVEL': 'INFO',
         'ENABLE_ACCESSLOG': 'false',
     }
 
-    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'DELETE_FILE_ON_TRASHCAN', 'DEFAULT_OPTION_PLAYLIST_STRICT_MODE', 'HTTPS', 'ENABLE_ACCESSLOG')
+    _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'DELETE_FILE_ON_TRASHCAN', 'HTTPS', 'ENABLE_ACCESSLOG')
 
     def __init__(self):
         for k, v in self._DEFAULTS.items():
@@ -245,7 +244,6 @@ async def add(request):
     format = post.get('format')
     folder = post.get('folder')
     custom_name_prefix = post.get('custom_name_prefix')
-    playlist_strict_mode = post.get('playlist_strict_mode')
     playlist_item_limit = post.get('playlist_item_limit')
     auto_start = post.get('auto_start')
     bypass_archive = post.get('bypass_archive')
@@ -256,8 +254,6 @@ async def add(request):
         custom_name_prefix = ''
     if auto_start is None:
         auto_start = True
-    if playlist_strict_mode is None:
-        playlist_strict_mode = config.DEFAULT_OPTION_PLAYLIST_STRICT_MODE
     if playlist_item_limit is None:
         playlist_item_limit = config.DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT
     if split_by_chapters is None:
@@ -267,7 +263,7 @@ async def add(request):
 
     playlist_item_limit = int(playlist_item_limit)
 
-    status = await dqueue.add(url, quality, format, folder, custom_name_prefix, playlist_strict_mode, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template)
+    status = await dqueue.add(url, quality, format, folder, custom_name_prefix, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template)
     return web.Response(text=serializer.encode(status))
 
 @routes.post(config.URL_PREFIX + 'delete')
@@ -408,7 +404,7 @@ async def on_prepare(request, response):
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
 
 app.on_response_prepare.append(on_prepare)
- 
+
 def supports_reuse_port():
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -107,8 +107,8 @@ export class DownloadsService {
     return of({status: 'error', msg: msg})
   }
 
-  public add(url: string, quality: string, format: string, folder: string, customNamePrefix: string, playlistStrictMode: boolean, playlistItemLimit: number, autoStart: boolean, bypassArchive: boolean, splitByChapters: boolean, chapterTemplate: string) {
-    return this.http.post<Status>('add', { url: url, quality: quality, format: format, folder: folder, custom_name_prefix: customNamePrefix, playlist_strict_mode: playlistStrictMode, playlist_item_limit: playlistItemLimit, auto_start: autoStart, bypass_archive: bypassArchive, split_by_chapters: splitByChapters, chapter_template: chapterTemplate }).pipe(
+  public add(url: string, quality: string, format: string, folder: string, customNamePrefix: string, playlistItemLimit: number, autoStart: boolean, bypassArchive: boolean, splitByChapters: boolean, chapterTemplate: string) {
+    return this.http.post<Status>('add', { url: url, quality: quality, format: format, folder: folder, custom_name_prefix: customNamePrefix, playlist_item_limit: playlistItemLimit, auto_start: autoStart, bypass_archive: bypassArchive, split_by_chapters: splitByChapters, chapter_template: chapterTemplate }).pipe(
       catchError(this.handleHTTPError)
     );
   }
@@ -118,12 +118,15 @@ export class DownloadsService {
   }
 
   public delById(where: State, ids: string[], deleteFile: boolean = false) {
-    ids.forEach(id => {
-      const obj = this[where].get(id)
-      if (obj) {
-        obj.deleting = true
+    const map = this[where];
+    if (map) {
+      for (const id of ids) {
+        const obj = map.get(id);
+        if (obj) {
+          obj.deleting = true;
+        }
       }
-  });
+    }
     return this.http.post('delete', {where: where, ids: ids, deleteFile: deleteFile});
   }
 
@@ -147,7 +150,6 @@ export class DownloadsService {
     const defaultFormat = 'mp4';
     const defaultFolder = ''; 
     const defaultCustomNamePrefix = '';
-    const defaultPlaylistStrictMode = false;
     const defaultPlaylistItemLimit = 0;
     const defaultAutoStart = true;
     const defaultBypassArchive = false;
@@ -155,7 +157,7 @@ export class DownloadsService {
     const defaultChapterTemplate = this.configuration['OUTPUT_TEMPLATE_CHAPTER'];
 
     return new Promise((resolve, reject) => {
-      this.add(url, defaultQuality, defaultFormat, defaultFolder, defaultCustomNamePrefix, defaultPlaylistStrictMode, defaultPlaylistItemLimit, defaultAutoStart, defaultBypassArchive, defaultSplitByChapters, defaultChapterTemplate)
+      this.add(url, defaultQuality, defaultFormat, defaultFolder, defaultCustomNamePrefix, defaultPlaylistItemLimit, defaultAutoStart, defaultBypassArchive, defaultSplitByChapters, defaultChapterTemplate)
         .subscribe({
           next: (response) => resolve(response),
           error: (error) => reject(error)

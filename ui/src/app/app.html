@@ -63,7 +63,7 @@
         <ul class="dropdown-menu dropdown-menu-end position-absolute" aria-labelledby="theme-select">
           @for (theme of themes; track theme) {
             <li>
-              <button type="button" class="dropdown-item d-flex align-items-center" 
+              <button type="button" class="dropdown-item d-flex align-items-center"
               [class.active]="activeTheme === theme"
               (click)="themeChanged(theme)">
                 <span class="me-2 opacity-50">
@@ -94,7 +94,7 @@
               autocomplete="off"
               spellcheck="false"
               class="form-control form-control-lg"
-              placeholder="Enter video or playlist URL"
+              placeholder="Enter video, channel, or playlist URL"
               name="addUrl"
               [(ngModel)]="addUrl"
               [disabled]="addInProgress || downloads.loading">
@@ -203,7 +203,7 @@
                       ngbTooltip="Choose where to save downloads. Type to create a new folder." />
                   }
                   </div>
-           
+
                 </div>
                 <div class="col-md-6">
                   <div class="input-group">
@@ -228,20 +228,7 @@
                       (keydown)="isNumber($event)"
                       [(ngModel)]="playlistItemLimit"
                       [disabled]="addInProgress || downloads.loading"
-                      ngbTooltip="Maximum number of items to download from a playlist (0 = no limit)">
-                  </div>
-                </div>
-                <div class="col-12">
-                  <div class="form-check form-switch">
-                    <input class="form-check-input"
-                      type="checkbox"
-                      role="switch"
-                      id="checkbox-strict-mode"
-                      name="playlistStrictMode"
-                      [(ngModel)]="playlistStrictMode"
-                      [disabled]="addInProgress || downloads.loading"
-                      ngbTooltip="Only download playlists when URL explicitly points to a playlist">
-                    <label class="form-check-label" for="checkbox-strict-mode">Strict Playlist Mode</label>
+                      ngbTooltip="Maximum number of items to download from a playlist or channel (0 = no limit)">
                   </div>
                 </div>
                 <div class="col-12">
@@ -309,7 +296,7 @@
   </form>
 
   <!-- Batch Import Modal -->
-  <div class="modal fade" tabindex="-1" role="dialog" 
+  <div class="modal fade" tabindex="-1" role="dialog"
   [class.show]="batchImportModalOpen"
   [style.display]="batchImportModalOpen ? 'block' : 'none'">
     <div class="modal-dialog" role="document">
@@ -375,7 +362,7 @@
             <td title="{{ download.value.filename }}">
               <div class="d-flex flex-column flex-sm-row align-items-center row-gap-2 column-gap-3">
                 <div>{{ download.value.title }} </div>
-                <ngb-progressbar height="1.5rem" [showValue]="download.value.status !== 'preparing'" [striped]="download.value.status === 'preparing'" [animated]="download.value.status === 'preparing'" type="success" 
+                <ngb-progressbar height="1.5rem" [showValue]="download.value.status !== 'preparing'" [striped]="download.value.status === 'preparing'" [animated]="download.value.status === 'preparing'" type="success"
                 [value]="download.value.status === 'preparing' ? 100 : download.value.percent" class="download-progressbar" />
               </div>
             </td>

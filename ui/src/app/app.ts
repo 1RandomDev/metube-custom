@@ -47,7 +47,6 @@ export class App implements AfterViewInit, OnInit {
   customNamePrefix!: string;
   autoStart: boolean;
   bypassArchive: boolean;
-  playlistStrictMode!: boolean;
   playlistItemLimit!: number;
   splitByChapters: boolean;
   chapterTemplate: string;
@@ -219,7 +218,6 @@ export class App implements AfterViewInit, OnInit {
     this.downloads.configurationChanged.subscribe({
        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       next: (config: any) => {
-        this.playlistStrictMode = config['DEFAULT_OPTION_PLAYLIST_STRICT_MODE'];
         const playlistItemLimit = config['DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT'];
         if (playlistItemLimit !== '0') {
           this.playlistItemLimit = playlistItemLimit;
@@ -303,13 +301,12 @@ export class App implements AfterViewInit, OnInit {
   }
 }
 
-  addDownload(url?: string, quality?: string, format?: string, folder?: string, customNamePrefix?: string, playlistStrictMode?: boolean, playlistItemLimit?: number, autoStart?: boolean, bypassArchive?: boolean, splitByChapters?: boolean, chapterTemplate?: string) {
+  addDownload(url?: string, quality?: string, format?: string, folder?: string, customNamePrefix?: string, playlistItemLimit?: number, autoStart?: boolean, bypassArchive?: boolean, splitByChapters?: boolean, chapterTemplate?: string) {
     url = url ?? this.addUrl
     quality = quality ?? this.quality
     format = format ?? this.format
     folder = folder ?? this.folder
     customNamePrefix = customNamePrefix ?? this.customNamePrefix
-    playlistStrictMode = playlistStrictMode ?? this.playlistStrictMode
     playlistItemLimit = playlistItemLimit ?? this.playlistItemLimit
     autoStart = autoStart ?? this.autoStart
     bypassArchive = bypassArchive ?? this.bypassArchive
@@ -322,9 +319,9 @@ export class App implements AfterViewInit, OnInit {
       return;
     }
 
-    console.debug('Downloading: url=' + url + ' quality=' + quality + ' format=' + format + ' folder=' + folder + ' customNamePrefix=' + customNamePrefix + ' playlistStrictMode=' + playlistStrictMode + ' playlistItemLimit=' + playlistItemLimit + ' autoStart=' + autoStart + ' bypassArchive=' + bypassArchive + ' splitByChapters=' + splitByChapters + ' chapterTemplate=' + chapterTemplate);
+    console.debug('Downloading: url=' + url + ' quality=' + quality + ' format=' + format + ' folder=' + folder + ' customNamePrefix=' + customNamePrefix + ' playlistItemLimit=' + playlistItemLimit + ' autoStart=' + autoStart + ' bypassArchive=' + bypassArchive + ' splitByChapters=' + splitByChapters + ' chapterTemplate=' + chapterTemplate);
     this.addInProgress = true;
-    this.downloads.add(url, quality, format, folder, customNamePrefix, playlistStrictMode, playlistItemLimit, autoStart, bypassArchive, splitByChapters, chapterTemplate).subscribe((status: Status) => {
+    this.downloads.add(url, quality, format, folder, customNamePrefix, playlistItemLimit, autoStart, bypassArchive, splitByChapters, chapterTemplate).subscribe((status: Status) => {
       if (status.status === 'error') {
         alert(`Error adding URL: ${status.msg}`);
       } else {
@@ -339,7 +336,7 @@ export class App implements AfterViewInit, OnInit {
   }
 
   retryDownload(key: string, download: Download) {
-    this.addDownload(download.url, download.quality, download.format, download.folder, download.custom_name_prefix, download.playlist_strict_mode, download.playlist_item_limit, true, true, download.split_by_chapters, download.chapter_template);
+    this.addDownload(download.url, download.quality, download.format, download.folder, download.custom_name_prefix, download.playlist_item_limit, true, true, download.split_by_chapters, download.chapter_template);
     this.downloads.delById('done', [key]).subscribe();
   }
 
@@ -485,7 +482,7 @@ export class App implements AfterViewInit, OnInit {
       this.batchImportStatus = `Importing URL ${index + 1} of ${urls.length}: ${url}`;
       // Now pass the selected quality, format, folder, etc. to the add() method
       this.downloads.add(url, this.quality, this.format, this.folder, this.customNamePrefix,
-        this.playlistStrictMode, this.playlistItemLimit, this.autoStart, this.bypassArchive, this.splitByChapters, this.chapterTemplate)
+        this.playlistItemLimit, this.autoStart, this.bypassArchive, this.splitByChapters, this.chapterTemplate)
         .subscribe({
           next: (status: Status) => {
             if (status.status === 'error') {
