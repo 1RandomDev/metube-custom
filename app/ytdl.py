@@ -11,12 +11,52 @@ import re
 import types
 import dbm
 import subprocess
+from typing import Any
+from functools import lru_cache
 
 import yt_dlp.networking.impersonate
+from yt_dlp.utils import STR_FORMAT_RE_TMPL, STR_FORMAT_TYPES
 from dl_formats import get_format, get_opts, AUDIO_FORMATS
 from datetime import datetime
 
 log = logging.getLogger('ytdl')
+
+
+@lru_cache(maxsize=None)
+def _compile_outtmpl_pattern(field: str) -> re.Pattern:
+    """Compile a regex pattern to match a specific field in an output template, including optional format specifiers."""
+    conversion_types = f"[{re.escape(STR_FORMAT_TYPES)}]"
+    return re.compile(STR_FORMAT_RE_TMPL.format(re.escape(field), conversion_types))
+
+
+def _outtmpl_substitute_field(template: str, field: str, value: Any) -> str:
+    """Substitute a single field in an output template, applying any format specifiers to the value."""
+    pattern = _compile_outtmpl_pattern(field)
+
+    def replacement(match: re.Match) -> str:
+        if match.group("has_key") is None:
+            return match.group(0)
+
+        prefix = match.group("prefix") or ""
+        format_spec = match.group("format")
+
+        if not format_spec:
+            return f"{prefix}{value}"
+
+        conversion_type = format_spec[-1]
+        try:
+            if conversion_type in "diouxX":
+                coerced_value = int(value)
+            elif conversion_type in "eEfFgG":
+                coerced_value = float(value)
+            else:
+                coerced_value = value
+
+            return f"{prefix}{('%' + format_spec) % coerced_value}"
+        except (ValueError, TypeError):
+            return f"{prefix}{value}"
+
+    return pattern.sub(replacement, template)
 
 def _convert_generators_to_lists(obj):
     """Recursively convert generators to lists in a dictionary to make it pickleable."""
@@ -105,10 +145,21 @@ class Download:
 
             def put_status_postprocessor(d):
                 if d['postprocessor'] == 'MoveFiles' and d['status'] == 'finished':
+                    filepath = d['info_dict']['filepath']
                     if '__finaldir' in d['info_dict']:
-                        filename = os.path.join(d['info_dict']['__finaldir'], os.path.basename(d['info_dict']['filepath']))
+                        finaldir = d['info_dict']['__finaldir']
+                        # Compute relative path from temp dir to preserve
+                        # subdirectory structure from the output template.
+                        try:
+                            rel_path = os.path.relpath(filepath, self.temp_dir)
+                        except ValueError:
+                            rel_path = os.path.basename(filepath)
+                        if rel_path.startswith('..'):
+                            # filepath is not under temp_dir, fall back to basename
+                            rel_path = os.path.basename(filepath)
+                        filename = os.path.join(finaldir, rel_path)
                     else:
-                        filename = d['info_dict']['filepath']
+                        filename = filepath
                     self.status_queue.put({'status': 'finished', 'filename': filename})
 
                 # Capture all chapter files when SplitChapters finishes
@@ -164,8 +215,14 @@ class Download:
         self.notifier = notifier
         self.info.status = 'preparing'
         await self.notifier.updated(self.info)
-        asyncio.create_task(self.update_status())
-        return await self.loop.run_in_executor(None, self.proc.join)
+        self.status_task = asyncio.create_task(self.update_status())
+        await self.loop.run_in_executor(None, self.proc.join)
+        # Signal update_status to stop and wait for it to finish
+        # so that all status updates (including MoveFiles with correct
+        # file size) are processed before _post_download_cleanup runs.
+        if self.status_queue is not None:
+            self.status_queue.put(None)
+        await self.status_task
 
     def cancel(self):
         log.info(f"Cancelling download: {self.info.title}")
@@ -182,8 +239,6 @@ class Download:
         log.info(f"Closing download process for: {self.info.title}")
         if self.started():
             self.proc.close()
-            if self.status_queue is not None:
-                self.status_queue.put(None)
 
     def running(self):
         try:
@@ -429,7 +484,7 @@ class DownloadQueue:
         base_directory = self.config.DOWNLOAD_DIR if (quality != 'audio' and format not in AUDIO_FORMATS) else self.config.AUDIO_DOWNLOAD_DIR
         if folder:
             if not self.config.CUSTOM_DIRS:
-                return None, {'status': 'error', 'msg': f'A folder for the download was specified but CUSTOM_DIRS is not true in the configuration.'}
+                return None, {'status': 'error', 'msg': 'A folder for the download was specified but CUSTOM_DIRS is not true in the configuration.'}
             dldirectory = os.path.realpath(os.path.join(base_directory, folder))
             real_base_directory = os.path.realpath(base_directory)
             if not dldirectory.startswith(real_base_directory):
@@ -454,13 +509,13 @@ class DownloadQueue:
                 output = self.config.OUTPUT_TEMPLATE_PLAYLIST
             for property, value in entry.items():
                 if property.startswith("playlist"):
-                    output = output.replace(f"%({property})s", str(value))
+                    output = _outtmpl_substitute_field(output, property, value)
         if entry is not None and entry.get('channel_index') is not None:
             if len(self.config.OUTPUT_TEMPLATE_CHANNEL):
                 output = self.config.OUTPUT_TEMPLATE_CHANNEL
             for property, value in entry.items():
                 if property.startswith("channel"):
-                    output = output.replace(f"%({property})s", str(value))
+                    output = _outtmpl_substitute_field(output, property, value)
         ytdl_options = dict(self.config.YTDL_OPTIONS)
         if(self.config.ARCHIVE_FILE and not bypass_archive):
             ytdl_options['download_archive'] = self.config.ARCHIVE_FILE
