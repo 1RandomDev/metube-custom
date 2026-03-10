@@ -1,4 +1,4 @@
-import { AsyncPipe, KeyValuePipe } from '@angular/common';
+import { AsyncPipe, DatePipe, KeyValuePipe } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { AfterViewInit, Component, ElementRef, viewChild, inject, OnInit } from '@angular/core';
 import { Observable, map, distinctUntilChanged } from 'rxjs';
@@ -6,7 +6,7 @@ import { FormsModule } from '@angular/forms';
 import { FontAwesomeModule } from '@fortawesome/angular-fontawesome';
 import { NgbModule } from '@ng-bootstrap/ng-bootstrap';
 import { NgSelectModule } from '@ng-select/ng-select';  
-import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt } from '@fortawesome/free-solid-svg-icons';
+import { faTrashAlt, faCheckCircle, faTimesCircle, faRedoAlt, faSun, faMoon, faCheck, faCircleHalfStroke, faDownload, faExternalLinkAlt, faFileImport, faFileExport, faCopy, faClock, faTachometerAlt, faSortAmountDown, faSortAmountUp, faChevronRight, faUpload } from '@fortawesome/free-solid-svg-icons';
 import { faGithub } from '@fortawesome/free-brands-svg-icons';
 import { CookieService } from 'ngx-cookie-service';
 import { DownloadsService } from './services/downloads.service';
@@ -21,6 +21,7 @@ import { MasterCheckboxComponent , SlaveCheckboxComponent} from './components/';
         FormsModule,
         KeyValuePipe,
         AsyncPipe,
+        DatePipe,
         FontAwesomeModule,
         NgbModule,
         NgSelectModule,
@@ -50,7 +51,13 @@ export class App implements AfterViewInit, OnInit {
   playlistItemLimit!: number;
   splitByChapters: boolean;
   chapterTemplate: string;
+  subtitleFormat: string;
+  subtitleLanguage: string;
+  subtitleMode: string;
   addInProgress = false;
+  cancelRequested = false;
+  hasCookies = false;
+  cookieUploadInProgress = false;
   themes: Theme[] = Themes;
   activeTheme: Theme | undefined;
   customDirs$!: Observable<string[]>;
@@ -64,6 +71,10 @@ export class App implements AfterViewInit, OnInit {
   ytDlpVersion: string | null = null;
   metubeVersion: string | null = null;
   isAdvancedOpen = false;
+  sortAscending = false;
+  expandedErrors: Set<string> = new Set();
+  cachedSortedDone: [string, Download][] = [];
+  lastCopiedErrorId: string | null = null;
 
   // Download metrics
   activeDownloads = 0;
@@ -98,6 +109,67 @@ export class App implements AfterViewInit, OnInit {
   faGithub = faGithub;
   faClock = faClock;
   faTachometerAlt = faTachometerAlt;
+  faSortAmountDown = faSortAmountDown;
+  faSortAmountUp = faSortAmountUp;
+  faChevronRight = faChevronRight;
+  faUpload = faUpload;
+  subtitleFormats = [
+    { id: 'srt', text: 'SRT' },
+    { id: 'txt', text: 'TXT (Text only)' },
+    { id: 'vtt', text: 'VTT' },
+    { id: 'ttml', text: 'TTML' }
+  ];
+  subtitleLanguages = [
+    { id: 'en', text: 'English' },
+    { id: 'ar', text: 'Arabic' },
+    { id: 'bn', text: 'Bengali' },
+    { id: 'bg', text: 'Bulgarian' },
+    { id: 'ca', text: 'Catalan' },
+    { id: 'cs', text: 'Czech' },
+    { id: 'da', text: 'Danish' },
+    { id: 'nl', text: 'Dutch' },
+    { id: 'es', text: 'Spanish' },
+    { id: 'et', text: 'Estonian' },
+    { id: 'fi', text: 'Finnish' },
+    { id: 'fr', text: 'French' },
+    { id: 'de', text: 'German' },
+    { id: 'el', text: 'Greek' },
+    { id: 'he', text: 'Hebrew' },
+    { id: 'hi', text: 'Hindi' },
+    { id: 'hu', text: 'Hungarian' },
+    { id: 'id', text: 'Indonesian' },
+    { id: 'it', text: 'Italian' },
+    { id: 'lt', text: 'Lithuanian' },
+    { id: 'lv', text: 'Latvian' },
+    { id: 'ms', text: 'Malay' },
+    { id: 'no', text: 'Norwegian' },
+    { id: 'pl', text: 'Polish' },
+    { id: 'pt', text: 'Portuguese' },
+    { id: 'pt-BR', text: 'Portuguese (Brazil)' },
+    { id: 'ro', text: 'Romanian' },
+    { id: 'ru', text: 'Russian' },
+    { id: 'sk', text: 'Slovak' },
+    { id: 'sl', text: 'Slovenian' },
+    { id: 'sr', text: 'Serbian' },
+    { id: 'sv', text: 'Swedish' },
+    { id: 'ta', text: 'Tamil' },
+    { id: 'te', text: 'Telugu' },
+    { id: 'th', text: 'Thai' },
+    { id: 'tr', text: 'Turkish' },
+    { id: 'uk', text: 'Ukrainian' },
+    { id: 'ur', text: 'Urdu' },
+    { id: 'vi', text: 'Vietnamese' },
+    { id: 'ja', text: 'Japanese' },
+    { id: 'ko', text: 'Korean' },
+    { id: 'zh-Hans', text: 'Chinese (Simplified)' },
+    { id: 'zh-Hant', text: 'Chinese (Traditional)' },
+  ];
+  subtitleModes = [
+    { id: 'prefer_manual', text: 'Prefer Manual' },
+    { id: 'prefer_auto', text: 'Prefer Auto' },
+    { id: 'manual_only', text: 'Manual Only' },
+    { id: 'auto_only', text: 'Auto Only' },
+  ];
 
   constructor() {
     this.format = this.cookieService.get('metube_format') || 'any';
@@ -109,6 +181,18 @@ export class App implements AfterViewInit, OnInit {
     this.splitByChapters = this.cookieService.get('metube_split_chapters') === 'true';
     // Will be set from backend configuration, use empty string as placeholder
     this.chapterTemplate = this.cookieService.get('metube_chapter_template') || '';
+    this.subtitleFormat = this.cookieService.get('metube_subtitle_format') || 'srt';
+    this.subtitleLanguage = this.cookieService.get('metube_subtitle_language') || 'en';
+    this.subtitleMode = this.cookieService.get('metube_subtitle_mode') || 'prefer_manual';
+    const allowedSubtitleFormats = new Set(this.subtitleFormats.map(fmt => fmt.id));
+    const allowedSubtitleModes = new Set(this.subtitleModes.map(mode => mode.id));
+    if (!allowedSubtitleFormats.has(this.subtitleFormat)) {
+      this.subtitleFormat = 'srt';
+    }
+    if (!allowedSubtitleModes.has(this.subtitleMode)) {
+      this.subtitleMode = 'prefer_manual';
+    }
+    this.sortAscending = this.cookieService.get('metube_sort_ascending') === 'true';
 
     this.activeTheme = this.getPreferredTheme(this.cookieService);
 
@@ -118,6 +202,7 @@ export class App implements AfterViewInit, OnInit {
     });
     this.downloads.doneChanged.subscribe(() => {
       this.updateMetrics();
+      this.rebuildSortedDone();
     });
     // Subscribe to real-time updates
     this.downloads.updated.subscribe(() => {
@@ -126,6 +211,9 @@ export class App implements AfterViewInit, OnInit {
   }
 
   ngOnInit() {
+    this.downloads.getCookieStatus().subscribe(data => {
+      this.hasCookies = data?.has_cookies || false;
+    });
     this.getConfiguration();
     this.getYtdlOptionsUpdateTime();
     this.customDirs$ = this.getMatchingCustomDir();
@@ -281,6 +369,18 @@ export class App implements AfterViewInit, OnInit {
     this.cookieService.set('metube_chapter_template', this.chapterTemplate, { expires: 3650 });
   }
 
+  subtitleFormatChanged() {
+    this.cookieService.set('metube_subtitle_format', this.subtitleFormat, { expires: 3650 });
+  }
+
+  subtitleLanguageChanged() {
+    this.cookieService.set('metube_subtitle_language', this.subtitleLanguage, { expires: 3650 });
+  }
+
+  subtitleModeChanged() {
+    this.cookieService.set('metube_subtitle_mode', this.subtitleMode, { expires: 3650 });
+  }
+
   queueSelectionChanged(checked: number) {
     this.queueDelSelected().nativeElement.disabled = checked == 0;
     this.queueDownloadSelected().nativeElement.disabled = checked == 0;
@@ -301,7 +401,21 @@ export class App implements AfterViewInit, OnInit {
   }
 }
 
-  addDownload(url?: string, quality?: string, format?: string, folder?: string, customNamePrefix?: string, playlistItemLimit?: number, autoStart?: boolean, bypassArchive?: boolean, splitByChapters?: boolean, chapterTemplate?: string) {
+  addDownload(
+    url?: string,
+    quality?: string,
+    format?: string,
+    folder?: string,
+    customNamePrefix?: string,
+    playlistItemLimit?: number,
+    autoStart?: boolean,
+    bypassArchive?: boolean,
+    splitByChapters?: boolean,
+    chapterTemplate?: string,
+    subtitleFormat?: string,
+    subtitleLanguage?: string,
+    subtitleMode?: string,
+  ) {
     url = url ?? this.addUrl
     quality = quality ?? this.quality
     format = format ?? this.format
@@ -312,6 +426,9 @@ export class App implements AfterViewInit, OnInit {
     bypassArchive = bypassArchive ?? this.bypassArchive
     splitByChapters = splitByChapters ?? this.splitByChapters
     chapterTemplate = chapterTemplate ?? this.chapterTemplate
+    subtitleFormat = subtitleFormat ?? this.subtitleFormat
+    subtitleLanguage = subtitleLanguage ?? this.subtitleLanguage
+    subtitleMode = subtitleMode ?? this.subtitleMode
 
     // Validate chapter template if chapter splitting is enabled
     if (splitByChapters && !chapterTemplate.includes('%(section_number)')) {
@@ -319,15 +436,26 @@ export class App implements AfterViewInit, OnInit {
       return;
     }
 
-    console.debug('Downloading: url=' + url + ' quality=' + quality + ' format=' + format + ' folder=' + folder + ' customNamePrefix=' + customNamePrefix + ' playlistItemLimit=' + playlistItemLimit + ' autoStart=' + autoStart + ' bypassArchive=' + bypassArchive + ' splitByChapters=' + splitByChapters + ' chapterTemplate=' + chapterTemplate);
+    console.debug('Downloading: url=' + url + ' quality=' + quality + ' format=' + format + ' folder=' + folder + ' customNamePrefix=' + customNamePrefix + ' playlistItemLimit=' + playlistItemLimit + ' autoStart=' + autoStart + ' bypassArchive=' + bypassArchive  + ' splitByChapters=' + splitByChapters + ' chapterTemplate=' + chapterTemplate + ' subtitleFormat=' + subtitleFormat + ' subtitleLanguage=' + subtitleLanguage + ' subtitleMode=' + subtitleMode);
     this.addInProgress = true;
-    this.downloads.add(url, quality, format, folder, customNamePrefix, playlistItemLimit, autoStart, bypassArchive, splitByChapters, chapterTemplate).subscribe((status: Status) => {
-      if (status.status === 'error') {
+    this.cancelRequested = false;
+    this.downloads.add(url, quality, format, folder, customNamePrefix, playlistItemLimit, autoStart, bypassArchive, splitByChapters, chapterTemplate, subtitleFormat, subtitleLanguage, subtitleMode).subscribe((status: Status) => {
+      if (status.status === 'error' && !this.cancelRequested) {
         alert(`Error adding URL: ${status.msg}`);
-      } else {
+      } else if (status.status !== 'error') {
         this.addUrl = '';
       }
       this.addInProgress = false;
+      this.cancelRequested = false;
+    });
+  }
+
+  cancelAdding() {
+    this.cancelRequested = true;
+    this.downloads.cancelAdd().subscribe({
+      error: (err) => {
+        console.error('Failed to cancel adding:', err?.message || err);
+      }
     });
   }
 
@@ -336,7 +464,21 @@ export class App implements AfterViewInit, OnInit {
   }
 
   retryDownload(key: string, download: Download) {
-    this.addDownload(download.url, download.quality, download.format, download.folder, download.custom_name_prefix, download.playlist_item_limit, true, true, download.split_by_chapters, download.chapter_template);
+    this.addDownload(
+      download.url,
+      download.quality,
+      download.format,
+      download.folder,
+      download.custom_name_prefix,
+      download.playlist_item_limit,
+      true,
+      true,
+      download.split_by_chapters,
+      download.chapter_template,
+      download.subtitle_format,
+      download.subtitle_language,
+      download.subtitle_mode,
+    );
     this.downloads.delById('done', [key]).subscribe();
   }
 
@@ -482,7 +624,8 @@ export class App implements AfterViewInit, OnInit {
       this.batchImportStatus = `Importing URL ${index + 1} of ${urls.length}: ${url}`;
       // Now pass the selected quality, format, folder, etc. to the add() method
       this.downloads.add(url, this.quality, this.format, this.folder, this.customNamePrefix,
-        this.playlistItemLimit, this.autoStart, this.bypassArchive, this.splitByChapters, this.chapterTemplate)
+        this.playlistItemLimit, this.autoStart, this.bypassArchive, this.splitByChapters, this.chapterTemplate,
+        this.subtitleFormat, this.subtitleLanguage, this.subtitleMode)
         .subscribe({
           next: (status: Status) => {
             if (status.status === 'error') {
@@ -587,6 +730,136 @@ export class App implements AfterViewInit, OnInit {
 
   toggleAdvanced() {
     this.isAdvancedOpen = !this.isAdvancedOpen;
+  }
+
+  toggleSortOrder() {
+    this.sortAscending = !this.sortAscending;
+    this.cookieService.set('metube_sort_ascending', this.sortAscending ? 'true' : 'false', { expires: 3650 });
+    this.rebuildSortedDone();
+  }
+
+  private rebuildSortedDone() {
+    const result: [string, Download][] = [];
+    this.downloads.done.forEach((dl, key) => {
+      result.push([key, dl]);
+    });
+    if (!this.sortAscending) {
+      result.reverse();
+    }
+    this.cachedSortedDone = result;
+  }
+
+  toggleErrorDetail(id: string) {
+    if (this.expandedErrors.has(id)) this.expandedErrors.delete(id);
+    else this.expandedErrors.add(id);
+  }
+
+  copyErrorMessage(id: string, download: Download) {
+    const parts: string[] = [];
+    if (download.title) parts.push(`Title: ${download.title}`);
+    if (download.url) parts.push(`URL: ${download.url}`);
+    if (download.msg) parts.push(`Message: ${download.msg}`);
+    if (download.error) parts.push(`Error: ${download.error}`);
+    const text = parts.join('\n');
+    if (!text.trim()) return;
+    const done = () => {
+      this.lastCopiedErrorId = id;
+      setTimeout(() => { this.lastCopiedErrorId = null; }, 1500);
+    };
+    const fail = (err?: unknown) => {
+      console.error('Clipboard write failed:', err);
+      alert('Failed to copy to clipboard. Your browser may require HTTPS for clipboard access.');
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(fail);
+    } else {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        done();
+      } catch (e) {
+        fail(e);
+      }
+    }
+  }
+
+  isErrorExpanded(id: string): boolean {
+    return this.expandedErrors.has(id);
+  }
+
+  onCookieFileSelect(event: Event) {
+    const input = event.target as HTMLInputElement;
+    if (!input.files?.length) return;
+    this.cookieUploadInProgress = true;
+    this.downloads.uploadCookies(input.files[0]).subscribe({
+      next: (response) => {
+        if (response?.status === 'ok') {
+          this.hasCookies = true;
+        } else {
+          this.refreshCookieStatus();
+          alert(`Error uploading cookies: ${this.formatErrorMessage(response?.msg)}`);
+        }
+        this.cookieUploadInProgress = false;
+        input.value = '';
+      },
+      error: () => {
+        this.refreshCookieStatus();
+        this.cookieUploadInProgress = false;
+        input.value = '';
+        alert('Error uploading cookies.');
+      }
+    });
+  }
+
+  private formatErrorMessage(error: unknown): string {
+    if (typeof error === 'string') {
+      return error;
+    }
+    if (error && typeof error === 'object') {
+      const obj = error as Record<string, unknown>;
+      for (const key of ['msg', 'reason', 'error', 'detail']) {
+        const value = obj[key];
+        if (typeof value === 'string' && value.trim()) {
+          return value;
+        }
+      }
+      try {
+        return JSON.stringify(error);
+      } catch {
+        return 'Unknown error';
+      }
+    }
+    return 'Unknown error';
+  }
+
+  deleteCookies() {
+    this.downloads.deleteCookies().subscribe({
+      next: (response) => {
+        if (response?.status === 'ok') {
+          this.refreshCookieStatus();
+          return;
+        }
+        this.refreshCookieStatus();
+        alert(`Error deleting cookies: ${this.formatErrorMessage(response?.msg)}`);
+      },
+      error: () => {
+        this.refreshCookieStatus();
+        alert('Error deleting cookies.');
+      }
+    });
+  }
+
+  private refreshCookieStatus() {
+    this.downloads.getCookieStatus().subscribe(data => {
+      this.hasCookies = data?.has_cookies || false;
+    });
   }
 
   private updateMetrics() {

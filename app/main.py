@@ -61,6 +61,7 @@ class Config:
         'OUTPUT_TEMPLATE_PLAYLIST': '%(playlist_title)s/%(title)s.%(ext)s',
         'OUTPUT_TEMPLATE_CHANNEL': '%(channel)s/%(title)s.%(ext)s',
         'DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT' : '0',
+        'CLEAR_COMPLETED_AFTER': '0',
         'YTDL_OPTIONS': '{}',
         'YTDL_OPTIONS_FILE': '',
         'ROBOTS_TXT': '',
@@ -98,9 +99,41 @@ class Config:
         if self.YTDL_OPTIONS_FILE and self.YTDL_OPTIONS_FILE.startswith('.'):
             self.YTDL_OPTIONS_FILE = str(Path(self.YTDL_OPTIONS_FILE).resolve())
 
+        self._runtime_overrides = {}
+
         success,_ = self.load_ytdl_options()
         if not success:
             sys.exit(1)
+
+    def set_runtime_override(self, key, value):
+        self._runtime_overrides[key] = value
+        self.YTDL_OPTIONS[key] = value
+
+    def remove_runtime_override(self, key):
+        self._runtime_overrides.pop(key, None)
+        self.YTDL_OPTIONS.pop(key, None)
+
+    def _apply_runtime_overrides(self):
+        self.YTDL_OPTIONS.update(self._runtime_overrides)
+
+    # Keys sent to the browser. Sensitive or server-only keys (YTDL_OPTIONS,
+    # paths, TLS config, etc.) are intentionally excluded.
+    _FRONTEND_KEYS = (
+        'CUSTOM_DIRS',
+        'CREATE_CUSTOM_DIRS',
+        'OUTPUT_TEMPLATE_CHAPTER',
+        'PUBLIC_HOST_URL',
+        'PUBLIC_HOST_AUDIO_URL',
+        'DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT',
+    )
+
+    def frontend_safe(self) -> dict:
+        """Return only the config keys that are safe to expose to browser clients.
+
+        Sensitive or server-only keys (YTDL_OPTIONS, file-system paths, TLS
+        settings, etc.) are intentionally excluded.
+        """
+        return {k: getattr(self, k) for k in self._FRONTEND_KEYS}
 
     def load_ytdl_options(self) -> tuple[bool, str]:
         try:
@@ -112,6 +145,7 @@ class Config:
             return (False, msg)
 
         if not self.YTDL_OPTIONS_FILE:
+            self._apply_runtime_overrides()
             return (True, '')
 
         log.info(f'Loading yt-dlp custom options from "{self.YTDL_OPTIONS_FILE}"')
@@ -129,6 +163,7 @@ class Config:
             return (False, msg)
 
         self.YTDL_OPTIONS.update(opts)
+        self._apply_runtime_overrides()
         return (True, '')
 
 config = Config()
@@ -157,6 +192,9 @@ app = web.Application()
 sio = socketio.AsyncServer(cors_allowed_origins='*')
 sio.attach(app, socketio_path=config.URL_PREFIX + 'socket.io')
 routes = web.RouteTableDef()
+VALID_SUBTITLE_FORMATS = {'srt', 'txt', 'vtt', 'ttml', 'sbv', 'scc', 'dfxp'}
+VALID_SUBTITLE_MODES = {'auto_only', 'manual_only', 'prefer_manual', 'prefer_auto'}
+SUBTITLE_LANGUAGE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,34}$')
 
 class Notifier(DownloadQueueNotifier):
     async def added(self, dl):
@@ -249,6 +287,9 @@ async def add(request):
     bypass_archive = post.get('bypass_archive')
     split_by_chapters = post.get('split_by_chapters')
     chapter_template = post.get('chapter_template')
+    subtitle_format = post.get('subtitle_format')
+    subtitle_language = post.get('subtitle_language')
+    subtitle_mode = post.get('subtitle_mode')
 
     if custom_name_prefix is None:
         custom_name_prefix = ''
@@ -262,13 +303,47 @@ async def add(request):
         split_by_chapters = False
     if chapter_template is None:
         chapter_template = config.OUTPUT_TEMPLATE_CHAPTER
+    if subtitle_format is None:
+        subtitle_format = 'srt'
+    if subtitle_language is None:
+        subtitle_language = 'en'
+    if subtitle_mode is None:
+        subtitle_mode = 'prefer_manual'
+    subtitle_format = str(subtitle_format).strip().lower()
+    subtitle_language = str(subtitle_language).strip()
+    subtitle_mode = str(subtitle_mode).strip()
     if chapter_template and ('..' in chapter_template or chapter_template.startswith('/') or chapter_template.startswith('\\')):
         raise web.HTTPBadRequest(reason='chapter_template must not contain ".." or start with a path separator')
+    if subtitle_format not in VALID_SUBTITLE_FORMATS:
+        raise web.HTTPBadRequest(reason=f'subtitle_format must be one of {sorted(VALID_SUBTITLE_FORMATS)}')
+    if not SUBTITLE_LANGUAGE_RE.fullmatch(subtitle_language):
+        raise web.HTTPBadRequest(reason='subtitle_language must match pattern [A-Za-z0-9-] and be at most 35 characters')
+    if subtitle_mode not in VALID_SUBTITLE_MODES:
+        raise web.HTTPBadRequest(reason=f'subtitle_mode must be one of {sorted(VALID_SUBTITLE_MODES)}')
 
     playlist_item_limit = int(playlist_item_limit)
 
-    status = await dqueue.add(url, quality, format, folder, custom_name_prefix, playlist_item_limit, auto_start, bypass_archive, split_by_chapters, chapter_template)
+    status = await dqueue.add(
+        url,
+        quality,
+        format,
+        folder,
+        custom_name_prefix,
+        playlist_item_limit,
+        auto_start,
+        bypass_archive,
+        split_by_chapters,
+        chapter_template,
+        subtitle_format,
+        subtitle_language,
+        subtitle_mode,
+    )
     return web.Response(text=serializer.encode(status))
+
+@routes.post(config.URL_PREFIX + 'cancel-add')
+async def cancel_add(request):
+    dqueue.cancel_add()
+    return web.Response(text=serializer.encode({'status': 'ok'}), content_type='application/json')
 
 @routes.post(config.URL_PREFIX + 'delete')
 async def delete(request):
@@ -290,6 +365,65 @@ async def start(request):
     status = await dqueue.start_pending(ids)
     return web.Response(text=serializer.encode(status))
 
+
+COOKIES_PATH = os.path.join(config.STATE_DIR, 'cookies.txt')
+
+@routes.post(config.URL_PREFIX + 'upload-cookies')
+async def upload_cookies(request):
+    reader = await request.multipart()
+    field = await reader.next()
+    if field is None or field.name != 'cookies':
+        return web.Response(status=400, text=serializer.encode({'status': 'error', 'msg': 'No cookies file provided'}))
+    size = 0
+    with open(COOKIES_PATH, 'wb') as f:
+        while True:
+            chunk = await field.read_chunk()
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 1_000_000:  # 1MB limit
+                os.remove(COOKIES_PATH)
+                return web.Response(status=400, text=serializer.encode({'status': 'error', 'msg': 'Cookie file too large (max 1MB)'}))
+            f.write(chunk)
+    config.set_runtime_override('cookiefile', COOKIES_PATH)
+    log.info(f'Cookies file uploaded ({size} bytes)')
+    return web.Response(text=serializer.encode({'status': 'ok', 'msg': f'Cookies uploaded ({size} bytes)'}))
+
+@routes.post(config.URL_PREFIX + 'delete-cookies')
+async def delete_cookies(request):
+    has_uploaded_cookies = os.path.exists(COOKIES_PATH)
+    configured_cookiefile = config.YTDL_OPTIONS.get('cookiefile')
+    has_manual_cookiefile = isinstance(configured_cookiefile, str) and configured_cookiefile and configured_cookiefile != COOKIES_PATH
+
+    if not has_uploaded_cookies:
+        if has_manual_cookiefile:
+            return web.Response(
+                status=400,
+                text=serializer.encode({
+                    'status': 'error',
+                    'msg': 'Cookies are configured manually via YTDL_OPTIONS (cookiefile). Remove or change that setting manually; UI delete only removes uploaded cookies.'
+                })
+            )
+        return web.Response(status=400, text=serializer.encode({'status': 'error', 'msg': 'No uploaded cookies to delete'}))
+
+    os.remove(COOKIES_PATH)
+    config.remove_runtime_override('cookiefile')
+    success, msg = config.load_ytdl_options()
+    if not success:
+        log.error(f'Cookies file deleted, but failed to reload YTDL_OPTIONS: {msg}')
+        return web.Response(status=500, text=serializer.encode({'status': 'error', 'msg': f'Cookies file deleted, but failed to reload YTDL_OPTIONS: {msg}'}))
+
+    log.info('Cookies file deleted')
+    return web.Response(text=serializer.encode({'status': 'ok'}))
+
+@routes.get(config.URL_PREFIX + 'cookie-status')
+async def cookie_status(request):
+    configured_cookiefile = config.YTDL_OPTIONS.get('cookiefile')
+    has_configured_cookies = isinstance(configured_cookiefile, str) and os.path.exists(configured_cookiefile)
+    has_uploaded_cookies = os.path.exists(COOKIES_PATH)
+    exists = has_uploaded_cookies or has_configured_cookies
+    return web.Response(text=serializer.encode({'status': 'ok', 'has_cookies': exists}))
+
 @routes.get(config.URL_PREFIX + 'history')
 async def history(request):
     history = { 'done': [], 'queue': [], 'pending': []}
@@ -308,7 +442,7 @@ async def history(request):
 async def connect(sid, environ):
     log.info(f"Client connected: {sid}")
     await sio.emit('all', serializer.encode(dqueue.get()), to=sid)
-    await sio.emit('configuration', serializer.encode(config), to=sid)
+    await sio.emit('configuration', serializer.encode(config.frontend_safe()), to=sid)
     if config.CUSTOM_DIRS:
         await sio.emit('custom_dirs', serializer.encode(get_custom_dirs()), to=sid)
     if config.YTDL_OPTIONS_FILE:
@@ -336,8 +470,12 @@ def get_custom_dirs():
             else:
                 return re.search(config.CUSTOM_DIRS_EXCLUDE_REGEX, d) is None
 
-        # Recursively lists all subdirectories of DOWNLOAD_DIR
+        # Recursively lists all subdirectories of DOWNLOAD_DIR.
+        # Always include '' (the base directory itself) even when the
+        # directory is empty or does not yet exist.
         dirs = list(filter(include_dir, map(convert, path.glob('**/'))))
+        if '' not in dirs:
+            dirs.insert(0, '')
 
         return dirs
 
@@ -401,6 +539,9 @@ async def add_cors(request):
     return web.Response(text=serializer.encode({"status": "ok"}))
 
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'add', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + 'cancel-add', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + 'upload-cookies', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + 'delete-cookies', add_cors)
 
 async def on_prepare(request, response):
     if 'Origin' in request.headers:
@@ -427,6 +568,12 @@ def isAccessLogEnabled():
 if __name__ == '__main__':
     logging.getLogger().setLevel(parseLogLevel(config.LOGLEVEL) or logging.INFO)
     log.info(f"Listening on {config.HOST}:{config.PORT}")
+
+
+    # Auto-detect cookie file on startup
+    if os.path.exists(COOKIES_PATH):
+        config.set_runtime_override('cookiefile', COOKIES_PATH)
+        log.info(f'Cookie file detected at {COOKIES_PATH}')
 
     if config.HTTPS:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)

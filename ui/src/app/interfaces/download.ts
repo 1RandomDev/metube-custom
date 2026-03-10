@@ -10,6 +10,9 @@ export interface Download {
   playlist_item_limit: number;
   split_by_chapters?: boolean;
   chapter_template?: string;
+  subtitle_format?: string;
+  subtitle_language?: string;
+  subtitle_mode?: string;
   status: string;
   msg: string;
   percent: number;
@@ -17,6 +20,7 @@ export interface Download {
   eta: number;
   filename: string;
   checked: boolean;
+  timestamp?: number;
   size?: number;
   error?: string;
   deleting?: boolean;

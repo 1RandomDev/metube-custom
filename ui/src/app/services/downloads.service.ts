@@ -107,8 +107,36 @@ export class DownloadsService {
     return of({status: 'error', msg: msg})
   }
 
-  public add(url: string, quality: string, format: string, folder: string, customNamePrefix: string, playlistItemLimit: number, autoStart: boolean, bypassArchive: boolean, splitByChapters: boolean, chapterTemplate: string) {
-    return this.http.post<Status>('add', { url: url, quality: quality, format: format, folder: folder, custom_name_prefix: customNamePrefix, playlist_item_limit: playlistItemLimit, auto_start: autoStart, bypass_archive: bypassArchive, split_by_chapters: splitByChapters, chapter_template: chapterTemplate }).pipe(
+  public add(
+    url: string,
+    quality: string,
+    format: string,
+    folder: string,
+    customNamePrefix: string,
+    playlistItemLimit: number,
+    autoStart: boolean,
+    bypassArchive: boolean,
+    splitByChapters: boolean,
+    chapterTemplate: string,
+    subtitleFormat: string,
+    subtitleLanguage: string,
+    subtitleMode: string,
+  ) {
+    return this.http.post<Status>('add', {
+      url: url,
+      quality: quality,
+      format: format,
+      folder: folder,
+      custom_name_prefix: customNamePrefix,
+      playlist_item_limit: playlistItemLimit,
+      auto_start: autoStart,
+      bypass_archive: bypassArchive,
+      split_by_chapters: splitByChapters,
+      chapter_template: chapterTemplate,
+      subtitle_format: subtitleFormat,
+      subtitle_language: subtitleLanguage,
+      subtitle_mode: subtitleMode
+    }).pipe(
       catchError(this.handleHTTPError)
     );
   }
@@ -155,9 +183,26 @@ export class DownloadsService {
     const defaultBypassArchive = false;
     const defaultSplitByChapters = false;
     const defaultChapterTemplate = this.configuration['OUTPUT_TEMPLATE_CHAPTER'];
+    const defaultSubtitleFormat = 'srt';
+    const defaultSubtitleLanguage = 'en';
+    const defaultSubtitleMode = 'prefer_manual';
 
     return new Promise((resolve, reject) => {
-      this.add(url, defaultQuality, defaultFormat, defaultFolder, defaultCustomNamePrefix, defaultPlaylistItemLimit, defaultAutoStart, defaultBypassArchive, defaultSplitByChapters, defaultChapterTemplate)
+      this.add(
+        url,
+        defaultQuality,
+        defaultFormat,
+        defaultFolder,
+        defaultCustomNamePrefix,
+        defaultPlaylistItemLimit,
+        defaultAutoStart,
+        defaultBypassArchive,
+        defaultSplitByChapters,
+        defaultChapterTemplate,
+        defaultSubtitleFormat,
+        defaultSubtitleLanguage,
+        defaultSubtitleMode,
+      )
         .subscribe({
           next: (response) => resolve(response),
           error: (error) => reject(error)
@@ -167,6 +212,29 @@ export class DownloadsService {
   public exportQueueUrls(): string[] {
     return Array.from(this.queue.values()).map(download => download.url);
   }
-  
-  
+  public cancelAdd() {
+    return this.http.post<Status>('cancel-add', {}).pipe(
+      catchError(this.handleHTTPError)
+    );
+  }
+
+  uploadCookies(file: File) {
+    const formData = new FormData();
+    formData.append('cookies', file);
+    return this.http.post<any>('upload-cookies', formData).pipe(
+      catchError(this.handleHTTPError)
+    );
+  }
+
+  deleteCookies() {
+    return this.http.post<any>('delete-cookies', {}).pipe(
+      catchError(this.handleHTTPError)
+    );
+  }
+
+  getCookieStatus() {
+    return this.http.get<any>('cookie-status').pipe(
+      catchError(this.handleHTTPError)
+    );
+  }
 }

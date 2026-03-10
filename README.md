@@ -36,6 +36,7 @@ Certain values can be set via environment variables, using the `-e` parameter on
 * __MAX_CONCURRENT_DOWNLOADS__: Maximum number of simultaneous downloads allowed. For example, if set to `5`, then at most five downloads will run concurrently, and any additional downloads will wait until one of the active downloads completes. Defaults to `3`. 
 * __DELETE_FILE_ON_TRASHCAN__: if `true`, downloaded files are deleted on the server, when they are trashed from the "Completed" section of the UI. Defaults to `false`.
 * __DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT__: Maximum number of playlist items that can be downloaded. Defaults to `0` (no limit).
+* __CLEAR_COMPLETED_AFTER__: Number of seconds after which completed (and failed) downloads are automatically removed from the "Completed" list. Defaults to `0` (disabled).
 
 ### 📁 Storage & Directories
 
@@ -57,8 +58,8 @@ Certain values can be set via environment variables, using the `-e` parameter on
 
 * __OUTPUT_TEMPLATE__: The template for the filenames of the downloaded videos, formatted according to [this spec](https://github.com/yt-dlp/yt-dlp/blob/master/README.md#output-template). Defaults to `%(title)s.%(ext)s`.
 * __OUTPUT_TEMPLATE_CHAPTER__: The template for the filenames of the downloaded videos when split into chapters via postprocessors. Defaults to `%(title)s - %(section_number)s %(section_title)s.%(ext)s`.
-* __OUTPUT_TEMPLATE_PLAYLIST__: The template for the filenames of the downloaded videos when downloaded as a playlist. Defaults to `%(playlist_title)s/%(title)s.%(ext)s`. When empty, then `OUTPUT_TEMPLATE` is used.
-* __OUTPUT_TEMPLATE_CHANNEL__: The template for the filenames of the downloaded videos when downloaded as a channel. Defaults to `%(channel)s/%(title)s.%(ext)s`. When empty, then `OUTPUT_TEMPLATE` is used.
+* __OUTPUT_TEMPLATE_PLAYLIST__: The template for the filenames of the downloaded videos when downloaded as a playlist. Defaults to `%(playlist_title)s/%(title)s.%(ext)s`. Set to empty to use `OUTPUT_TEMPLATE` instead.
+* __OUTPUT_TEMPLATE_CHANNEL__: The template for the filenames of the downloaded videos when downloaded as a channel. Defaults to `%(channel)s/%(title)s.%(ext)s`. Set to empty to use `OUTPUT_TEMPLATE` instead.
 * __YTDL_OPTIONS__: Additional options to pass to yt-dlp in JSON format. [See available options here](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/YoutubeDL.py#L222). They roughly correspond to command-line options, though some do not have exact equivalents here. For example, `--recode-video` has to be specified via `postprocessors`. Also note that dashes are replaced with underscores. You may find [this script](https://github.com/yt-dlp/yt-dlp/blob/master/devscripts/cli_to_api.py) helpful for converting from command-line options to `YTDL_OPTIONS`.
 * __YTDL_OPTIONS_FILE__: A path to a JSON file that will be loaded and used for populating `YTDL_OPTIONS` above. Please note that if both `YTDL_OPTIONS_FILE` and `YTDL_OPTIONS` are specified, the options in `YTDL_OPTIONS` take precedence. The file will be monitored for changes and reloaded automatically when changes are detected.
 
@@ -91,21 +92,13 @@ The project's Wiki contains examples of useful configurations contributed by use
 
 In case you need to use your browser's cookies with MeTube, for example to download restricted or private videos:
 
-* Add the following to your docker-compose.yml:
-
-```yaml
-    volumes:
-      - /path/to/cookies:/cookies
-    environment:
-      - YTDL_OPTIONS={"cookiefile":"/cookies/cookies.txt"}
-```
-
 * Install in your browser an extension to extract cookies:
   * [Firefox](https://addons.mozilla.org/en-US/firefox/addon/export-cookies-txt/)
   * [Chrome](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
-* Extract the cookies you need with the extension and rename the file `cookies.txt`
-* Drop the file in the folder you configured in the docker-compose.yml above
-* Restart the container
+* Extract the cookies you need with the extension and save/export them as `cookies.txt`.
+* In MeTube, open **Advanced Options** and use the **Upload Cookies** button to upload the file.
+* After upload, the cookie indicator should show as active.
+* Use **Delete Cookies** in the same section to remove uploaded cookies.
 
 ## 🔌 Browser extensions
 
