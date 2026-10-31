@@ -212,6 +212,26 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     Config()
 
+    def test_ytdl_update_channel_defaults_to_nightly(self):
+        for value in (None, "", "  "):
+            env = _base_env() if value is None else _base_env(YTDL_UPDATE_CHANNEL=value)
+            with patch.dict(os.environ, env, clear=False):
+                if value is None:
+                    os.environ.pop("YTDL_UPDATE_CHANNEL", None)
+                c = Config()
+            self.assertEqual(c.YTDL_UPDATE_CHANNEL, "nightly")
+
+    def test_ytdl_update_channel_stable_normalized(self):
+        with patch.dict(os.environ, _base_env(YTDL_UPDATE_CHANNEL=" Stable "), clear=False):
+            c = Config()
+        self.assertEqual(c.YTDL_UPDATE_CHANNEL, "stable")
+
+    def test_ytdl_update_channel_invalid_exits(self):
+        for bad in ("beta", "master"):
+            with patch.dict(os.environ, _base_env(YTDL_UPDATE_CHANNEL=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
     def test_invalid_max_concurrent_downloads_exits(self):
         for bad in ("0", "-1", "abc"):
             with patch.dict(os.environ, _base_env(MAX_CONCURRENT_DOWNLOADS=bad), clear=False):

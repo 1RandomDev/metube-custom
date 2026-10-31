@@ -10,12 +10,21 @@ echo "Creating download directory (${DOWNLOAD_DIR}), audio download directory ($
 mkdir -p "${DOWNLOAD_DIR}" "${AUDIO_DOWNLOAD_DIR}" "${STATE_DIR}" "${TEMP_DIR}"
 
 do_upgrade() {
-    echo "Upgrading yt-dlp to nightly channel..."
+    channel="${YTDL_UPDATE_CHANNEL:-nightly}"
+    case "${channel}" in
+        nightly) pre="--pre" ;;
+        stable) pre="" ;;
+        *)
+            echo "Warning: YTDL_UPDATE_CHANNEL must be \"nightly\" or \"stable\", got \"${YTDL_UPDATE_CHANNEL}\"; skipping yt-dlp upgrade"
+            return 1
+            ;;
+    esac
+    echo "Upgrading yt-dlp to ${channel} channel..."
     if ! python3 -m pip --version >/dev/null 2>&1; then
         echo "pip not found; attempting ensurepip"
         python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
     fi
-    if ! python3 -m pip install -U --pre "yt-dlp[default,curl-cffi,deno]"; then
+    if ! python3 -m pip install -U ${pre} "yt-dlp[default,curl-cffi,deno]"; then
         echo "Warning: yt-dlp nightly upgrade failed; continuing with existing installation"
         return 1
     fi

@@ -112,6 +112,7 @@ class Config:
         'LOGLEVEL': 'INFO',
         'ENABLE_ACCESSLOG': 'false',
         'YTDL_NIGHTLY_UPDATE_TIME': '',
+        'YTDL_UPDATE_CHANNEL': 'nightly',
     }
 
     _BOOLEAN = ('DOWNLOAD_DIRS_INDEXABLE', 'CUSTOM_DIRS', 'CREATE_CUSTOM_DIRS', 'HTTPS', 'ENABLE_ACCESSLOG', 'ALLOW_YTDL_OPTIONS_OVERRIDES', 'ALLOW_PRIVATE_ADDRESSES')
@@ -204,6 +205,16 @@ class Config:
             log.error(
                 'Environment variable "YTDL_NIGHTLY_UPDATE_TIME" must be HH:MM (24-hour), got "%s"',
                 self.YTDL_NIGHTLY_UPDATE_TIME,
+            )
+            sys.exit(1)
+
+        # What the YTDL_NIGHTLY_UPDATE_TIME update installs; docker-entrypoint.sh
+        # does the upgrade and reads the same variable.
+        self.YTDL_UPDATE_CHANNEL = self.YTDL_UPDATE_CHANNEL.strip().lower() or self._DEFAULTS['YTDL_UPDATE_CHANNEL']
+        if self.YTDL_UPDATE_CHANNEL not in ('nightly', 'stable'):
+            log.error(
+                'Environment variable "YTDL_UPDATE_CHANNEL" must be "nightly" or "stable", got "%s"',
+                self.YTDL_UPDATE_CHANNEL,
             )
             sys.exit(1)
 
@@ -837,9 +848,10 @@ async def _schedule_nightly_update() -> None:
     if not time_hhmm:
         return
     delay = seconds_until_next_daily_time(time_hhmm)
-    log.info('Next yt-dlp nightly update in %.0f seconds (at %s local time)', delay, time_hhmm)
+    channel = config.YTDL_UPDATE_CHANNEL
+    log.info('Next yt-dlp nightly update in %.0f seconds (at %s local time)', channel, delay, time_hhmm)
     await asyncio.sleep(delay)
-    log.info('Scheduled yt-dlp nightly update: requesting restart')
+    log.info('Scheduled yt-dlp nightly update: requesting restart', channel)
     _RESTART_FOR_UPDATE = True
     asyncio.get_running_loop().call_soon(_request_graceful_exit)
 

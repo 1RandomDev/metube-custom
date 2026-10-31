@@ -97,7 +97,8 @@ Templates use [yt-dlp's output template syntax](https://github.com/yt-dlp/yt-dlp
 | `YTDL_OPTIONS_PRESETS` | `{}` | Named option bundles, picked per download in the UI. |
 | `YTDL_OPTIONS_PRESETS_FILE` | | Path to a JSON file of presets. Reloaded when it changes; wins over `YTDL_OPTIONS_PRESETS` for the same name. |
 | `ALLOW_YTDL_OPTIONS_OVERRIDES` | `false` | Show a field for per-download yt-dlp options in the UI. Trusted users only: it allows running commands in the container. |
-| `YTDL_NIGHTLY_UPDATE_TIME` | | Use [nightly yt-dlp builds](https://github.com/yt-dlp/yt-dlp-nightly-builds), upgrading and restarting daily at this time (`HH:MM`, 24-hour). |
+| `YTDL_NIGHTLY_UPDATE_TIME` | | Upgrade yt-dlp on startup and daily at this time (`HH:MM`, 24-hour), restarting MeTube for it. `YTDL_UPDATE_CHANNEL` picks what gets installed. |
+| `YTDL_UPDATE_CHANNEL` | `nightly` | What `YTDL_NIGHTLY_UPDATE_TIME` upgrades to: `nightly` for [nightly yt-dlp builds](https://github.com/yt-dlp/yt-dlp-nightly-builds), `stable` for the latest release. |
 
 ### Web server and network
 
@@ -145,7 +146,7 @@ The [wiki](https://github.com/alexta69/metube/wiki) covers everything beyond the
 
 ## Keeping yt-dlp up to date
 
-Sites change constantly, and yt-dlp keeps up with frequent releases. A new MeTube image is published automatically for every yt-dlp stable release, so keep your container updated — [watchtower](https://github.com/nicholas-fedor/watchtower) can do it for you. To follow yt-dlp's nightly builds instead, set `YTDL_NIGHTLY_UPDATE_TIME`.
+Sites change constantly, and yt-dlp keeps up with frequent releases. A new MeTube image is published automatically for every yt-dlp stable release, so keep your container updated — [watchtower](https://github.com/nicholas-fedor/watchtower) can do it for you. To follow yt-dlp's nightly builds instead, set `YTDL_NIGHTLY_UPDATE_TIME`; with `YTDL_UPDATE_CHANNEL=stable` it updates to each new stable release without waiting for a new image.
 
 ## Troubleshooting and support
 
