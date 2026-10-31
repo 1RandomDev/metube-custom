@@ -23,6 +23,106 @@ class ConfigTests(unittest.TestCase):
             c = Config()
         self.assertEqual(c.URL_PREFIX, "foo/")
 
+    def test_public_host_url_gets_trailing_slash(self):
+        with patch.dict(
+            os.environ,
+            _base_env(PUBLIC_HOST_URL="https://ytdl.example.com"),
+            clear=False,
+        ):
+            c = Config()
+        self.assertEqual(c.PUBLIC_HOST_URL, "https://ytdl.example.com/")
+
+    def test_public_host_audio_url_gets_trailing_slash(self):
+        with patch.dict(
+            os.environ,
+            _base_env(PUBLIC_HOST_AUDIO_URL="https://audio.example.com"),
+            clear=False,
+        ):
+            c = Config()
+        self.assertEqual(c.PUBLIC_HOST_AUDIO_URL, "https://audio.example.com/")
+
+    def test_public_host_url_empty_stays_empty(self):
+        with patch.dict(
+            os.environ,
+            _base_env(PUBLIC_HOST_URL="", PUBLIC_HOST_AUDIO_URL=""),
+            clear=False,
+        ):
+            c = Config()
+        self.assertEqual(c.PUBLIC_HOST_URL, "")
+        self.assertEqual(c.PUBLIC_HOST_AUDIO_URL, "")
+
+    def test_host_wildcard_becomes_empty_for_dual_stack(self):
+        # Regression: aiohttp passes HOST to getaddrinfo, which does not resolve
+        # '*' -- the server died at startup on a DNS error. '*' now selects the
+        # empty string, the only value asyncio expands to a listening socket per
+        # address family.
+        for raw in ("*", " * "):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, _base_env(HOST=raw), clear=False):
+                    c = Config()
+                self.assertEqual(c.HOST, "")
+
+    def test_host_literal_addresses_are_untouched(self):
+        for raw in ("0.0.0.0", "::", "127.0.0.1", ""):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, _base_env(HOST=raw), clear=False):
+                    c = Config()
+                self.assertEqual(c.HOST, raw)
+
+    def test_blank_audio_host_falls_back_to_audio_download_route(self):
+        # Regression: a present-but-blank PUBLIC_HOST_AUDIO_URL must not stay empty
+        # (which produced root-relative, 404ing audio links). It falls back to the
+        # 'audio_download/' route that serves AUDIO_DOWNLOAD_DIR.
+        with patch.dict(
+            os.environ,
+            _base_env(PUBLIC_HOST_URL="https://ytdl.example.com", PUBLIC_HOST_AUDIO_URL=""),
+            clear=False,
+        ):
+            c = Config()
+        self.assertEqual(c.PUBLIC_HOST_URL, "https://ytdl.example.com/")
+        self.assertEqual(c.PUBLIC_HOST_AUDIO_URL, "audio_download/")
+
+    def test_public_host_url_already_slashed_unchanged(self):
+        with patch.dict(
+            os.environ,
+            _base_env(
+                PUBLIC_HOST_URL="https://ytdl.example.com/",
+                PUBLIC_HOST_AUDIO_URL="https://audio.example.com/",
+            ),
+            clear=False,
+        ):
+            c = Config()
+        self.assertEqual(c.PUBLIC_HOST_URL, "https://ytdl.example.com/")
+        self.assertEqual(c.PUBLIC_HOST_AUDIO_URL, "https://audio.example.com/")
+
+    def test_download_dirs_lose_trailing_slash(self):
+        # get_custom_dirs strips the base path as a prefix from each subdirectory,
+        # and the base directory's own path has no trailing slash -- so a trailing
+        # slash here leaked the absolute path into the folder dropdown.
+        with patch.dict(os.environ, _base_env(
+            DOWNLOAD_DIR="/downloads/",
+            AUDIO_DOWNLOAD_DIR="/audio/",
+            TEMP_DIR="/tmp/",
+            STATE_DIR="/state/",
+        ), clear=False):
+            c = Config()
+        self.assertEqual(c.DOWNLOAD_DIR, "/downloads")
+        self.assertEqual(c.AUDIO_DOWNLOAD_DIR, "/audio")
+        self.assertEqual(c.TEMP_DIR, "/tmp")
+        self.assertEqual(c.STATE_DIR, "/state")
+
+    def test_root_download_dir_survives_normalisation(self):
+        with patch.dict(os.environ, _base_env(DOWNLOAD_DIR="/", AUDIO_DOWNLOAD_DIR="///"), clear=False):
+            c = Config()
+        self.assertEqual(c.DOWNLOAD_DIR, "/")
+        self.assertEqual(c.AUDIO_DOWNLOAD_DIR, "/")
+
+    def test_download_dirs_without_trailing_slash_unchanged(self):
+        with patch.dict(os.environ, _base_env(DOWNLOAD_DIR="/downloads", AUDIO_DOWNLOAD_DIR="."), clear=False):
+            c = Config()
+        self.assertEqual(c.DOWNLOAD_DIR, "/downloads")
+        self.assertEqual(c.AUDIO_DOWNLOAD_DIR, ".")
+
     def test_ytdl_options_json_loaded(self):
         opts = {"quiet": True, "no_warnings": True}
         with patch.dict(
@@ -43,6 +143,14 @@ class ConfigTests(unittest.TestCase):
             c = Config()
         self.assertEqual(c.YTDL_OPTIONS_PRESETS["Audio extras"]["embed_thumbnail"], True)
 
+    def test_blank_ytdl_options_and_presets_mean_none(self):
+        # A compose file often sets a variable to nothing; that used to be
+        # parsed as JSON and stop the server.
+        with patch.dict(os.environ, _base_env(YTDL_OPTIONS="", YTDL_OPTIONS_PRESETS="  "), clear=False):
+            c = Config()
+        self.assertEqual(c.YTDL_OPTIONS, {})
+        self.assertEqual(c.YTDL_OPTIONS_PRESETS, {})
+
     def test_invalid_ytdl_options_exits(self):
         with patch.dict(os.environ, _base_env(YTDL_OPTIONS="not-json"), clear=False):
             with self.assertRaises(SystemExit):
@@ -61,10 +169,149 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("HOST", safe)
         self.assertEqual(safe["ALLOW_YTDL_OPTIONS_OVERRIDES"], False)
 
+    def test_default_folder_empty_by_default(self):
+        with patch.dict(os.environ, _base_env(), clear=False):
+            c = Config()
+        self.assertEqual(c.DEFAULT_FOLDER, "")
+
+    def test_default_folder_is_trimmed_and_reaches_the_frontend(self):
+        with patch.dict(os.environ, _base_env(DEFAULT_FOLDER=" /youtube/ "), clear=False):
+            c = Config()
+        self.assertEqual(c.DEFAULT_FOLDER, "youtube")
+        self.assertEqual(c.frontend_safe()["DEFAULT_FOLDER"], "youtube")
+
+    def test_default_folder_ignored_without_custom_dirs(self):
+        # The folder field is not shown at all without CUSTOM_DIRS, and sending
+        # a folder anyway is rejected by the download path check.
+        with patch.dict(
+            os.environ,
+            _base_env(DEFAULT_FOLDER="youtube", CUSTOM_DIRS="false"),
+            clear=False,
+        ):
+            c = Config()
+        self.assertEqual(c.DEFAULT_FOLDER, "")
+
     def test_allow_ytdl_options_overrides_boolean_loaded(self):
         with patch.dict(os.environ, _base_env(ALLOW_YTDL_OPTIONS_OVERRIDES="true"), clear=False):
             c = Config()
         self.assertTrue(c.ALLOW_YTDL_OPTIONS_OVERRIDES)
+
+    def test_ytdl_nightly_update_time_empty_default(self):
+        with patch.dict(os.environ, _base_env(YTDL_NIGHTLY_UPDATE_TIME=""), clear=False):
+            c = Config()
+        self.assertEqual(c.YTDL_NIGHTLY_UPDATE_TIME, "")
+
+    def test_ytdl_nightly_update_time_valid(self):
+        with patch.dict(os.environ, _base_env(YTDL_NIGHTLY_UPDATE_TIME="04:00"), clear=False):
+            c = Config()
+        self.assertEqual(c.YTDL_NIGHTLY_UPDATE_TIME, "04:00")
+
+    def test_ytdl_nightly_update_time_invalid_exits(self):
+        for bad in ("25:00", "4am", "12:60"):
+            with patch.dict(os.environ, _base_env(YTDL_NIGHTLY_UPDATE_TIME=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_invalid_max_concurrent_downloads_exits(self):
+        for bad in ("0", "-1", "abc"):
+            with patch.dict(os.environ, _base_env(MAX_CONCURRENT_DOWNLOADS=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_invalid_port_exits(self):
+        for bad in ("0", "70000", "notaport"):
+            with patch.dict(os.environ, _base_env(PORT=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_invalid_clear_completed_after_exits(self):
+        for bad in ("-5", "soon"):
+            with patch.dict(os.environ, _base_env(CLEAR_COMPLETED_AFTER=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_clear_completed_after_zero_allowed(self):
+        with patch.dict(os.environ, _base_env(CLEAR_COMPLETED_AFTER="0"), clear=False):
+            c = Config()
+        self.assertEqual(c.CLEAR_COMPLETED_AFTER, 0)
+
+    def test_invalid_default_option_playlist_item_limit_exits(self):
+        for bad in ("-1", "many"):
+            with patch.dict(os.environ, _base_env(DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_default_option_playlist_item_limit_zero_allowed(self):
+        with patch.dict(os.environ, _base_env(DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT="0"), clear=False):
+            c = Config()
+        self.assertEqual(c.DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT, 0)
+
+    def test_invalid_subscription_default_check_interval_exits(self):
+        for bad in ("0", "-1", "often"):
+            with patch.dict(os.environ, _base_env(SUBSCRIPTION_DEFAULT_CHECK_INTERVAL=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_invalid_subscription_scan_playlist_end_exits(self):
+        for bad in ("0", "-1", "all"):
+            with patch.dict(os.environ, _base_env(SUBSCRIPTION_SCAN_PLAYLIST_END=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_invalid_subscription_max_seen_ids_exits(self):
+        for bad in ("0", "-1", "unlimited"):
+            with patch.dict(os.environ, _base_env(SUBSCRIPTION_MAX_SEEN_IDS=bad), clear=False):
+                with self.assertRaises(SystemExit):
+                    Config()
+
+    def test_validated_integers_are_stored_as_ints(self):
+        with patch.dict(os.environ, _base_env(MAX_CONCURRENT_DOWNLOADS="5", PORT="9000",
+                                              CLEAR_COMPLETED_AFTER="60"), clear=False):
+            c = Config()
+        for key, expected in (
+            ("MAX_CONCURRENT_DOWNLOADS", 5), ("PORT", 9000), ("CLEAR_COMPLETED_AFTER", 60),
+            ("DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT", 0), ("SUBSCRIPTION_DEFAULT_CHECK_INTERVAL", 60),
+            ("SUBSCRIPTION_SCAN_PLAYLIST_END", 50), ("SUBSCRIPTION_MAX_SEEN_IDS", 50000),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(getattr(c, key), expected)
+                self.assertIs(type(getattr(c, key)), int)
+
+    def test_invalid_custom_dirs_exclude_regex_exits(self):
+        with patch.dict(os.environ, _base_env(CUSTOM_DIRS_EXCLUDE_REGEX="("), clear=False):
+            with self.assertRaises(SystemExit):
+                Config()
+
+    def test_custom_dirs_exclude_regex_compiled(self):
+        with patch.dict(os.environ, _base_env(CUSTOM_DIRS_EXCLUDE_REGEX="^tmp"), clear=False):
+            c = Config()
+        self.assertIsNotNone(c.CUSTOM_DIRS_EXCLUDE_RE.search("tmp/x"))
+        with patch.dict(os.environ, _base_env(CUSTOM_DIRS_EXCLUDE_REGEX=""), clear=False):
+            self.assertIsNone(Config().CUSTOM_DIRS_EXCLUDE_RE)
+
+    def test_invalid_loglevel_exits(self):
+        for raw in ("LOUD", "basic_format"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, _base_env(LOGLEVEL=raw), clear=False):
+                    with self.assertRaises(SystemExit):
+                        Config()
+
+    def test_blank_loglevel_and_theme_take_defaults(self):
+        with patch.dict(os.environ, _base_env(LOGLEVEL=" ", DEFAULT_THEME=""), clear=False):
+            c = Config()
+        self.assertEqual(c.LOGLEVEL, "INFO")
+        self.assertEqual(c.DEFAULT_THEME, "auto")
+
+    def test_loglevel_none_accepted(self):
+        with patch.dict(os.environ, _base_env(LOGLEVEL="NONE"), clear=False):
+            Config()
+
+    def test_default_theme_normalized_and_validated(self):
+        with patch.dict(os.environ, _base_env(DEFAULT_THEME=" Dark "), clear=False):
+            self.assertEqual(Config().DEFAULT_THEME, "dark")
+        with patch.dict(os.environ, _base_env(DEFAULT_THEME="purple"), clear=False):
+            with self.assertRaises(SystemExit):
+                Config()
 
     def test_runtime_override_roundtrip(self):
         with patch.dict(os.environ, _base_env(), clear=False):
@@ -88,6 +335,42 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("extractor_args", c.YTDL_OPTIONS)
         finally:
             os.unlink(path)
+
+    def test_delete_file_on_trashcan_default_is_false(self):
+        with patch.dict(os.environ, _base_env(), clear=False):
+            c = Config()
+        self.assertEqual(c.DELETE_FILE_ON_TRASHCAN, "false")
+
+    def test_delete_file_on_trashcan_ask_spellings_normalize(self):
+        for raw in ("ask", "Ask", "ASK"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, _base_env(DELETE_FILE_ON_TRASHCAN=raw), clear=False):
+                    c = Config()
+                self.assertEqual(c.DELETE_FILE_ON_TRASHCAN, "ask")
+
+    def test_delete_file_on_trashcan_true_spellings_normalize(self):
+        for raw in ("true", "True", "on", "1"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, _base_env(DELETE_FILE_ON_TRASHCAN=raw), clear=False):
+                    c = Config()
+                self.assertEqual(c.DELETE_FILE_ON_TRASHCAN, "true")
+
+    def test_delete_file_on_trashcan_false_spellings_normalize(self):
+        for raw in ("false", "False", "off", "0"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, _base_env(DELETE_FILE_ON_TRASHCAN=raw), clear=False):
+                    c = Config()
+                self.assertEqual(c.DELETE_FILE_ON_TRASHCAN, "false")
+
+    def test_delete_file_on_trashcan_invalid_value_exits(self):
+        with patch.dict(os.environ, _base_env(DELETE_FILE_ON_TRASHCAN="maybe"), clear=False):
+            with self.assertRaises(SystemExit):
+                Config()
+
+    def test_delete_file_on_trashcan_reaches_frontend(self):
+        with patch.dict(os.environ, _base_env(), clear=False):
+            c = Config()
+        self.assertIn("DELETE_FILE_ON_TRASHCAN", c.frontend_safe())
 
     def test_ytdl_option_presets_file_merges(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

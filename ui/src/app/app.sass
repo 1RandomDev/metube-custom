@@ -1,58 +1,12 @@
+@use 'styles/sections'
+
 .add-url-box
     max-width: 1200px
     margin: 4rem auto
 
-.metube-section-header
-    font-size: 1.8rem
-    font-weight: 300
-    position: relative
-    background: var(--bs-secondary-bg)
-    padding: 0.5rem 0
-    margin-top: 3.5rem
-
-.metube-section-header:before
-    content: ""
-    position: absolute
-    top: 0
-    bottom: 0
-    left: -9999px
-    right: 0
-    border-left: 9999px solid var(--bs-secondary-bg)
-    box-shadow: 9999px 0 0 var(--bs-secondary-bg)
-
-button:hover
-    text-decoration: none
-
-th
-    border-top: 0
-    border-bottom-width: 3px !important
-    vertical-align: middle !important
-    white-space: nowrap
-
-td
-    vertical-align: middle
-
-.disabled
-    opacity: 0.5
-    pointer-events: none
-
 .form-switch
   input
     margin-top: 5px
-
-.download-progressbar
-    width: 12rem
-    margin-left: auto
-
-.modal.fade.show
-  background-color: rgba(0, 0, 0, 0.5)
-
-.modal-header
-  border-bottom: 1px solid var(--bs-border-color)
-
-.modal-body
-  textarea.form-control
-    resize: vertical
 
 .add-url
   display: inline-flex
@@ -61,6 +15,27 @@ td
 
   .spinner-border
     margin-right: 0.5rem
+
+// Download + dropdown toggle fused into one split button. Bootstrap's radius
+// rules only look at direct children of .input-group / .btn-group, so where the
+// pair sits as a middle child of the input group both buttons are squared off
+// by hand: flat against the URL field on the left and Subscribe on the right,
+// and flat between each other. (Not :first-child / :last-child: the last child
+// of the idle group is the dropdown menu, not the toggle.) Inside the narrow
+// layout's btn-group Bootstrap does this itself.
+.input-group > .download-split > .btn
+  border-radius: 0
+
+// In the narrow layout's full-width btn-group the pair stretches like the
+// other buttons; the toggle keeps its own (narrow) width.
+.btn-group > .download-split
+  flex: 1 1 auto
+
+  > .btn:first-child
+    flex: 1 1 auto
+
+  > .dropdown-toggle-split
+    flex: 0 0 auto
 
 .add-progress-btn
   min-width: 9.5rem

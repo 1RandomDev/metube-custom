@@ -1,0 +1,186 @@
+# Agent Guidelines
+
+## Project scope — read this before planning a feature
+
+MeTube's contract is: give it a URL, it runs yt-dlp well, and correct files appear.
+The maintainer holds a deliberate line on what belongs inside that contract, and PRs
+on the wrong side of it are declined **regardless of code quality**. Check your plan
+against this line before writing any code.
+
+**In scope — improving the write itself:**
+
+- Features that make the file yt-dlp writes at download time come out more correct,
+  using only data the extractor already provides (e.g. filling a missing album-artist
+  tag from the extractor's own metadata).
+- Surfacing functionality yt-dlp itself owns and maintains as first-class UI options
+  (e.g. a SponsorBlock toggle that just passes yt-dlp postprocessor params).
+- Download queue, subscriptions, output templates, and UI improvements to the
+  download workflow.
+
+**Out of scope — managing files after they exist:**
+
+- Tag editors, metadata dialogs, or any workflow that rewrites files after the
+  download has finished. This holds even for slimmed-down versions.
+- Lookups against external metadata services (iTunes, Deezer, MusicBrainz, etc.).
+  More broadly: any new dependency on a third-party API, or new network egress from
+  self-hosted instances, beyond what yt-dlp itself performs.
+- Library organization: moving/renaming existing files into Artist/Album layouts,
+  watch-folder processing, and similar media-manager features. Dedicated tools
+  (beets, MusicBrainz Picard, Lidarr) do this properly; the README points users
+  to them.
+
+**Corollaries that shape borderline PRs:**
+
+- Site-specific intelligence (parsing playlist-ID prefixes, URL path conventions,
+  and other platform internals) is extractor work and belongs upstream in yt-dlp,
+  not re-implemented here — it silently breaks when the platform changes and
+  MeTube would own the breakage.
+- Prefer enriching yt-dlp's info dict and letting its existing pipeline
+  (FFmpegMetadata etc.) do the writing, over adding custom per-format tag-writing
+  code to MeTube.
+- Supplemental processing must never fail a download that otherwise succeeded:
+  warn and continue, don't raise.
+- Keep feature scope minimal on first submission. A hardcoded sensible default
+  beats a configuration surface; follow-ups can add options when users actually
+  ask. PRs that bundle several "reasonable next steps" invite rejection of the
+  whole.
+
+If a feature idea fails this test, the accepted alternative is usually documentation
+on pairing MeTube with the right dedicated tool — a wiki guide, or a pointer in the
+README.
+
+## Documentation: where content goes
+
+The README is synced verbatim to Docker Hub, which rejects descriptions over
+**25,000 bytes** (CI checks `wc -c README.md`). Rather than trimming prose to fit,
+each kind of content has one home:
+
+- **README.md** — what MeTube is, the quick start, and the environment variable
+  reference: **one table row per variable**, a sentence or two at most. A variable
+  that needs more explanation gets a section in a wiki guide, linked from its row.
+  No free-text paragraphs in the configuration section. A PR that adds an env var
+  adds its row in the same diff.
+- **Wiki** (<https://github.com/alexta69/metube/wiki>, a separate git repository:
+  `https://github.com/alexta69/metube.wiki.git`) — guides, concepts, recipes,
+  integrations, and troubleshooting. Explanations of behavior go here.
+- **CONTRIBUTING.md** — the scope summary for humans, the feature request policy,
+  and building and testing locally.
+
+Links in README.md must be absolute URLs: on Docker Hub, relative links break. If the
+README passes 15,000 bytes, something in it belongs in the wiki.
+
+## Tech stack
+
+- **Backend:** Python 3.13+, aiohttp, python-socketio 5.x, yt-dlp
+- **Frontend:** Angular 22, TypeScript, Bootstrap 5, SASS, ngx-socket-io
+- **Package managers:** uv (Python), pnpm (frontend)
+- **Container:** Multi-stage Docker (Node builder + Python runtime), multi-arch (amd64/arm64)
+
+## Build & test commands
+
+```bash
+# Frontend (run from ui/)
+pnpm install --frozen-lockfile
+pnpm run lint
+pnpm run build
+pnpm exec ng test --watch=false
+
+# Backend (run from repo root)
+uv sync --frozen --group dev
+uv run python -m compileall -q app
+uv run pytest app/tests/
+```
+
+All of these run in CI (`.github/workflows/main.yml`) on every push to master and must pass.
+
+The backend tests need no frontend build and can run from the repo root or
+from `app/`: `app/tests/conftest.py` points `BASE_DIR` at a stand-in UI
+directory before `main` is imported.
+
+Every non-markdown push to master builds multi-arch Docker images and cuts a dated
+release the same day. **Master is continuously released** — a PR must be
+release-ready exactly as merged; there is no stabilization window for follow-up
+fixes.
+
+## Commit messages
+
+A commit that resolves an issue must close it, with a GitHub closing keyword in
+parentheses at the end of the subject line:
+
+```
+fix: stop metadata probes from writing playlist sidecar files (closes #1040)
+```
+
+Because master is the default branch and is released on every push, the issue
+closes at the moment the fix ships, and keeps a permanent link to the commit that
+fixed it. A bare `(#1040)` is only a reference — and reads as a pull-request
+number — so it does not count; the keyword is what closes the issue.
+
+Auto-closing leaves only a commit stub on the issue, which is not an answer to
+whoever reported it. Post an explanatory comment as well: what the cause was, what
+changed, and anything the reporter needs to do differently.
+
+Follow `.editorconfig`:
+- Python: 4-space indent
+- Everything else (TypeScript, YAML, JSON, HTML): 2-space indent
+- UTF-8, LF line endings, trim trailing whitespace, final newline
+
+Frontend additionally uses ESLint (`ui/eslint.config.js`) and Prettier (config in `ui/package.json`: `printWidth=100`, `singleQuote=true`).
+
+## Project structure
+
+```
+app/main.py          — HTTP server, Socket.IO events, REST API routes, Config class
+app/ytdl.py          — Download queue logic, yt-dlp integration
+app/download_options.py — DownloadOptions: one request's options, passed whole through the queue
+app/subscriptions.py — Channel/playlist subscription manager
+app/state_store.py   — JSON-based persistent storage with atomic writes
+app/format_catalog.py — The download options (types, codecs, formats, qualities, labels, defaults)
+app/dl_formats.py    — Maps those options onto yt-dlp format selectors and options
+app/tests/           — pytest tests (asyncio_mode=auto)
+ui/src/app/          — Angular standalone components (no NgModules)
+```
+
+## Key conventions
+
+- Backend configuration lives in the `Config` class in `app/main.py` with env-var defaults in `_DEFAULTS`. New env vars go there.
+- Download options are defined only in `app/format_catalog.py`. Request validation, `dl_formats`, the UI's form (sent over Socket.IO on connect) and `GET /formats` all read it; never hardcode an option list or id elsewhere. A new codec, format or quality also needs its yt-dlp mapping in `dl_formats`, which `test_format_catalog.py` enforces.
+- Real-time communication uses Socket.IO events, not REST polling.
+- Frontend uses standalone Angular components with `inject()` for DI, RxJS Subjects for state, and `takeUntilDestroyed()` for cleanup.
+- Frontend components use OnPush change detection: subscribe callbacks must call `cdr.markForCheck()`.
+- State is persisted as JSON files via `AtomicJsonStore` in `app/state_store.py`.
+- Persisted state stays compact: the completed queue deliberately drops bulky entry data (see `_compact_persisted_entry` in `app/ytdl.py`). Don't expand what gets persisted without discussion.
+- Custom yt-dlp postprocessors added to `ytdl_params['postprocessors']` run in **list order** within a stage. When combining postprocessors, mirror the ordering the yt-dlp CLI would produce (e.g. sponsor-segment removal before chapter splitting).
+- No pre-commit hooks — linting and tests are enforced in CI only.
+
+## Checklist: adding a per-download option
+
+New options on the download form (the `split_by_chapters` pattern) need **all** of
+these pieces — the last three are the ones commonly missed:
+
+1. A field on `DownloadOptions` in `app/download_options.py`, set by
+   `parse_download_options` in `app/main.py`. The queue's add, playlist,
+   failed-add and retry paths all carry that one value, so nothing else in
+   them needs touching.
+2. A field on `DownloadInfo` in `app/ytdl.py`.
+3. A default in `_DOWNLOAD_INFO_DEFAULTS` in `app/ytdl.py`, which old persisted
+   records take (a test fails if a `DownloadInfo` field has none).
+4. The safe-deserialization field list in `app/ytdl.py`.
+5. UI form control + `SettingsStore` persistence in `ui/src/app/app.ts` / `app.html`, and
+   the payload in `downloads.service.ts` (plus its spec).
+6. The redownload path in `app.ts`, so retries carry the option.
+7. If the option makes sense for unattended downloads: threading through
+   `app/subscriptions.py` (`SubscriptionInfo` field, serializer, add/update
+   routes, `SubscriptionInfo.download_options()`) — or a note in the PR that it's deliberately
+   direct-downloads-only.
+
+## Security invariants
+
+User input and extractor-provided metadata (titles, playlist names, URLs) are
+untrusted. Use the existing guards instead of hand-rolling:
+
+- User-submitted URLs go through the SSRF guard (see `test_url_guard.py` for the
+  expected behavior).
+- Anything that becomes a filesystem path goes through `_is_within_directory` and
+  `_sanitize_path_component` in `app/ytdl.py` — including values that arrive via
+  yt-dlp metadata, which sites can influence.

@@ -1,0 +1,22 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Quick Resources
+
+        Your question may already be answered here:
+        - **[README](https://github.com/alexta69/metube#readme)** — setup, and the reference for every environment variable
+        - **[Wiki](https://github.com/alexta69/metube/wiki)** — guides and recipes: subscriptions, yt-dlp options, output templates, browser cookies, sending links from browsers and phones, reverse proxies, GPU transcoding, yt-dlp plugins
+        - **[Troubleshooting FAQ](https://github.com/alexta69/metube/wiki/Troubleshooting-FAQ)** — common problems and their fixes
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your Question
+      description: What would you like to know about MeTube?
+      placeholder: |
+        What are you trying to achieve?
+        What's your current setup (docker-compose / environment variables)?
+        What have you tried so far, and what happened (errors, logs)?
+    validations:
+      required: true

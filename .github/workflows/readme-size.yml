@@ -1,0 +1,24 @@
+name: readme-size
+
+on:
+  push:
+    paths:
+      - 'README.md'
+  pull_request:
+    paths:
+      - 'README.md'
+
+jobs:
+  check-size:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Check README stays under Docker Hub's 25,000-byte limit
+        run: |
+          size=$(wc -c < README.md)
+          echo "README.md is ${size} bytes (budget 15000, Docker Hub limit 25000)"
+          if [ "$size" -gt 15000 ]; then
+            echo "::warning file=README.md::README.md is ${size} bytes, over its 15,000-byte budget. Move explanations to the wiki (see AGENTS.md)."
+          fi
+          test "$size" -lt 25000

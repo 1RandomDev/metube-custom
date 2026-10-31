@@ -1,8 +1,43 @@
+"""Maps the options in format_catalog onto yt-dlp format selectors and options."""
+
 import copy
 
-AUDIO_FORMATS = ("m4a", "mp3", "opus", "wav", "flac")
-CAPTION_MODES = ("auto_only", "manual_only", "prefer_manual", "prefer_auto")
+import format_catalog
 
+# FFmpegExtractAudio targets for the "auto" audio format, in yt-dlp's
+# --audio-format rule syntax ("SOURCE>TARGET/.../FALLBACK", matched on the
+# downloaded file's extension).
+#
+# With tags: "best" keeps the codec the site served and only moves it into a
+# container that can carry tags and a cover (YouTube's webm Opus -> .opus, by
+# stream copy). The explicit rules cover the files "best" would leave as they
+# are but EmbedThumbnail refuses; a failed embed would fail the download.
+_AUTO_AUDIO_TAGGABLE = "wav>flac/aiff>flac/wma>mp3/best"
+# Without tags the file is kept exactly as served; only a video container
+# (a site with no audio-only stream) has its audio copied out. An extension
+# with no rule is skipped before ffmpeg runs at all. webm is deliberately
+# absent: YouTube's audio-only streams are webm.
+_AUTO_AUDIO_AS_SERVED = "/".join(
+    f"{ext}>best"
+    for ext in ("mp4", "m4v", "mov", "mkv", "flv", "avi", "3gp", "wmv", "mpg", "ogv")
+)
+
+
+def merge_ytdl_option_layers(presets, overrides, presets_config) -> dict:
+    """Overlay named presets (in order) then per-item overrides onto a fresh dict.
+
+    Does NOT include any base ``YTDL_OPTIONS`` — callers layer this on top of
+    their own base (a per-download build adds the global base; a subscription
+    scan relies on ``**config.YTDL_OPTIONS`` already being present in its
+    params). ``presets_config`` maps a preset name to its options dict.
+    """
+    merged: dict = {}
+    for name in presets or []:
+        merged.update(presets_config.get(name, {}))
+    merged.update(overrides or {})
+    return merged
+
+# Every codec in the catalog other than "auto" needs an entry here.
 CODEC_FILTER_MAP = {
     'h264': "[vcodec~='^(h264|avc)']",
     'h265': "[vcodec~='^(h265|hevc)']",
@@ -13,12 +48,14 @@ CODEC_FILTER_MAP = {
 
 def _normalize_caption_mode(mode: str) -> str:
     mode = (mode or "").strip()
-    return mode if mode in CAPTION_MODES else "prefer_manual"
+    if mode in format_catalog.choice_ids("captions", "subtitle_mode"):
+        return mode
+    return format_catalog.choice_default("captions", "subtitle_mode")
 
 
 def _normalize_subtitle_language(language: str) -> str:
     language = (language or "").strip()
-    return language or "en"
+    return language or format_catalog.choice_default("captions", "subtitle_language")
 
 
 def get_format(download_type: str, codec: str, format: str, quality: str) -> str:
@@ -43,6 +80,10 @@ def get_format(download_type: str, codec: str, format: str, quality: str) -> str
     quality = (quality or "best").strip().lower()
 
     if format.startswith("custom:"):
+        # Unreachable via the HTTP API (format is validated against a fixed
+        # set in main.py), but legacy persisted downloads may carry a
+        # custom: format from before that validation existed; removing this
+        # would crash PersistentQueue.load() for those records.
         return format[7:]
 
     if download_type == "thumbnail":
@@ -52,12 +93,14 @@ def get_format(download_type: str, codec: str, format: str, quality: str) -> str
         return "bestaudio/best"
 
     if download_type == "audio":
-        if format not in AUDIO_FORMATS:
+        if format not in format_catalog.format_ids("audio"):
             raise ValueError(f"Unknown audio format {format}")
+        if format == "auto":
+            return "bestaudio/best"
         return f"bestaudio[ext={format}]/bestaudio/best"
 
     if download_type == "video":
-        if format not in ("any", "mp4", "ios"):
+        if format not in format_catalog.format_ids("video"):
             raise ValueError(f"Unknown video format {format}")
         vfmt, afmt = ("[ext=mp4]", "[ext=m4a]") if format in ("mp4", "ios") else ("", "")
         vres = f"[height<={quality}]" if quality not in ("best", "worst") else ""
@@ -82,6 +125,7 @@ def get_opts(
     ytdl_opts: dict,
     subtitle_language: str = "en",
     subtitle_mode: str = "prefer_manual",
+    audio_tags: str = "with_cover",
 ) -> dict:
     """
     Returns extra yt-dlp options/postprocessors.
@@ -92,6 +136,8 @@ def get_opts(
       format (str): selected format/profile
       quality (str): selected quality
       ytdl_opts (dict): current options selected
+      audio_tags (str): for audio, what to write into the file
+        (with_cover, no_cover, none)
 
     Returns:
       dict: extended options
@@ -103,25 +149,37 @@ def get_opts(
     postprocessors = []
 
     if download_type == "audio":
+        if audio_tags not in format_catalog.choice_ids("audio", "audio_tags"):
+            audio_tags = format_catalog.choice_default("audio", "audio_tags")
+
+        if format == "auto":
+            preferredcodec = _AUTO_AUDIO_AS_SERVED if audio_tags == "none" else _AUTO_AUDIO_TAGGABLE
+        else:
+            preferredcodec = format
         postprocessors.append(
             {
                 "key": "FFmpegExtractAudio",
-                "preferredcodec": format,
+                "preferredcodec": preferredcodec,
                 "preferredquality": 0 if quality == "best" else quality,
             }
         )
 
-        if format != "wav" and "writethumbnail" not in opts:
-            opts["writethumbnail"] = True
-            postprocessors.append(
-                {
-                    "key": "FFmpegThumbnailsConvertor",
-                    "format": "jpg",
-                    "when": "before_dl",
-                }
-            )
+        # A writethumbnail key in the user's options means they manage
+        # thumbnails themselves, so the whole tagging chain stays off.
+        tags_possible = format_catalog.format_supports_tags("audio", format)
+        if tags_possible and audio_tags != "none" and "writethumbnail" not in opts:
+            if audio_tags == "with_cover":
+                opts["writethumbnail"] = True
+                postprocessors.append(
+                    {
+                        "key": "FFmpegThumbnailsConvertor",
+                        "format": "jpg",
+                        "when": "before_dl",
+                    }
+                )
             postprocessors.append({"key": "FFmpegMetadata"})
-            postprocessors.append({"key": "EmbedThumbnail"})
+            if audio_tags == "with_cover":
+                postprocessors.append({"key": "EmbedThumbnail"})
 
     if download_type == "thumbnail":
         opts["skip_download"] = True
@@ -137,7 +195,20 @@ def get_opts(
         requested_subtitle_format = (format or "srt").lower()
         if requested_subtitle_format == "txt":
             requested_subtitle_format = "srt"
-        opts["subtitlesformat"] = requested_subtitle_format
+        opts["subtitlesformat"] = f"{requested_subtitle_format}/best"
+        if requested_subtitle_format in ("srt", "vtt"):
+            # subtitlesformat above is only a preference: if the extractor
+            # doesn't natively offer this ext (e.g. YouTube has no native srt),
+            # yt-dlp silently falls back to whatever it has. ffmpeg can only
+            # convert to srt/vtt/ass/lrc, so only guarantee the requested
+            # container for those; other formats stay best-effort.
+            postprocessors.append(
+                {
+                    "key": "FFmpegSubtitlesConvertor",
+                    "format": requested_subtitle_format,
+                    "when": "before_dl",
+                }
+            )
         if mode == "manual_only":
             opts["writesubtitles"] = True
             opts["writeautomaticsub"] = False

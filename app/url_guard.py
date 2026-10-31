@@ -1,0 +1,467 @@
+"""Lightweight SSRF guard for user-submitted URLs.
+
+MeTube hands user-submitted URLs to yt-dlp, whose generic extractor will fetch
+any ``http(s)`` URL. Without a guard, an attacker can make the server fetch
+internal endpoints (cloud metadata services, loopback, RFC1918 hosts, etc.) and
+have the response saved to the download directory and served back.
+
+This module provides two layers:
+
+* ``validate_url`` — a cheap validator applied at every URL ingress.
+* ``install_socket_guard`` — a connect-time ``getaddrinfo`` guard installed in
+  the download subprocess, which re-validates every resolved address and so
+  covers redirects, DNS rebinding, and media URLs yt-dlp derives from remote
+  metadata — for any backend that resolves through Python's socket module.
+
+Known limitations — network isolation (e.g. Docker) remains the backstop for
+all of these:
+
+* The socket guard is installed only in the download subprocess. Metadata
+  extraction (``ytdl.DownloadQueue.__extract_info``) runs in the main process,
+  where installing a process-wide guard would reject the server's own bind on
+  ``HOST=0.0.0.0``. So extraction — which also follows redirects — is covered
+  only by ``validate_url`` at ingress, not at connect time; a redirect from an
+  allowed host to an internal one during extraction is not blocked (a lower-
+  impact, blind SSRF, since the extraction response is not written to disk).
+  The one main-process pass that *does* write a fetched response to disk — the
+  playlist/channel metadata files (``__write_feed_metadata``), whose thumbnail
+  URL comes from the feed — runs under ``socket_guard_scope``, the same guard
+  applied to the calling thread only.
+* Native resolvers (curl_cffi/libcurl via ``--impersonate``) resolve outside
+  Python's socket module and bypass the connect-time guard entirely.
+* When a proxy carries the fetch and resolves hostnames itself (an HTTP proxy,
+  ``socks5h``, ``socks4a``, or the plain ``socks5`` yt-dlp rewrites to
+  ``socks5h``), ``validate_url`` cannot check where a *hostname* leads: the
+  proxy resolves it on its own network, and looking it up here would both
+  describe the wrong network and leak the hostname to the local resolver. The
+  address check is skipped for those, and what the proxy's network exposes is
+  the proxy's to police. Hosts written as IP literals are still checked, and
+  the connect-time guard still covers everything dialled directly.
+"""
+
+import contextlib
+import ipaddress
+import logging
+import socket
+import threading
+import urllib.request
+from urllib.parse import urlsplit
+
+log = logging.getLogger('url_guard')
+
+_ALLOWED_SCHEMES = ('http', 'https')
+
+# Ports to assume when a configured endpoint URL omits one, per scheme.
+_SCHEME_DEFAULT_PORTS = {
+    'http': 80,
+    'https': 443,
+    'socks4': 1080,
+    'socks4a': 1080,
+    'socks5': 1080,
+    'socks5h': 1080,
+}
+
+# Proxy schemes that hand the destination hostname to the proxy instead of
+# resolving it here. yt-dlp rewrites a scheme-less proxy to ``http`` and plain
+# ``socks5`` to ``socks5h`` on every request (``clean_proxies``), so only SOCKS4
+# — and the non-standard ``socks`` alias yt-dlp maps onto it — still resolves
+# locally and is therefore absent from this list.
+_REMOTE_DNS_PROXY_SCHEMES = ('http', 'https', 'socks5', 'socks5h', 'socks4a')
+
+# Hostnames that must be blocked without needing a lookup. ``localhost`` and any
+# subdomain of it are conventionally loopback, and the GCP metadata name is a
+# well-known SSRF target that may resolve via a resolver we don't control.
+_BLOCKED_HOSTNAMES = ('localhost', 'metadata.google.internal')
+
+
+def _hostname_is_blocked(hostname: str) -> bool:
+    host = hostname.rstrip('.').lower()
+    for blocked in _BLOCKED_HOSTNAMES:
+        if host == blocked or host.endswith('.' + blocked):
+            return True
+    return False
+
+
+# IPv6 ranges that tunnel an IPv4 address at a fixed offset. ``is_global``
+# judges only the outer address, so an internal IPv4 wrapped in one of these can
+# pass a check the bare address would fail — 64:ff9b::a9fe:a9fe carries the cloud
+# metadata address but sits in the 2000::/3 global unicast range.
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network('64:ff9b::/96')
+_IPV4_COMPATIBLE = ipaddress.ip_network('::/96')
+
+# ``::`` and ``::1`` sit inside ::/96 without being IPv4-compatible addresses
+# (RFC 4291 reserves both), and 0.0.0.0/8 is not a routable destination anyway.
+# Reading a tunnelled address out of them would just misdescribe them.
+_UNUSABLE_IPV4 = ipaddress.ip_network('0.0.0.0/8')
+
+
+def _normalise_ip(addr: str):
+    """Parse *addr*, unwrapping IPv4-mapped IPv6 (e.g. ``::ffff:169.254.169.254``)
+    so the embedded IPv4 address is judged on its own merits. Returns ``None``
+    when *addr* is not a valid IP literal."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+def _tunnelled_ipv4(ip):
+    """The IPv4 address an IPv6 transition form tunnels, or ``None``.
+
+    Covers 6to4 (``2002::/16``), Teredo (``2001::/32``), the NAT64 well-known
+    prefix (``64:ff9b::/96``) and the deprecated IPv4-compatible form
+    (``::/96``). IPv4-mapped is handled by ``_normalise_ip`` instead: that form
+    *is* its embedded address rather than a tunnel to it.
+    """
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return None
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip.teredo is not None:
+        return ip.teredo[1]
+    if ip in _NAT64_WELL_KNOWN_PREFIX or ip in _IPV4_COMPATIBLE:
+        tunnelled = ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+        return None if tunnelled in _UNUSABLE_IPV4 else tunnelled
+    return None
+
+
+def _ips_to_judge(addr: str) -> tuple:
+    """Every address a verdict on *addr* has to account for: the address itself
+    plus any IPv4 it tunnels. Empty when *addr* is not a valid IP literal.
+
+    A tunnelled address is judged on *both* halves, so unwrapping can only ever
+    tighten the verdict. Returning the embedded address alone would be a way in:
+    Python already rejects all of 2002::/16 and 2001::/32, and replacing
+    ``2002:0808:0808::`` with the global 8.8.8.8 would turn an address the guard
+    blocks today into an allowed one.
+    """
+    ip = _normalise_ip(addr)
+    if ip is None:
+        return ()
+    tunnelled = _tunnelled_ipv4(ip)
+    return (ip,) if tunnelled is None else (ip, tunnelled)
+
+
+def _address_is_global(addr: str) -> bool:
+    ips = _ips_to_judge(addr)
+    return bool(ips) and all(ip.is_global for ip in ips)
+
+
+def _address_allowed_at_connect(addr: str, is_allowed_endpoint: bool = False) -> bool:
+    """True if *addr* may be connected to at download time.
+
+    Permits global addresses, and anything at all when the destination is an
+    endpoint the operator or the image configured — a proxy, or the PO token
+    provider (see ``_is_allowed_endpoint``). Internal addresses are otherwise
+    refused with no blanket exception: media URLs that yt-dlp derives from a
+    remote manifest are attacker-controlled and reach this policy without passing
+    ``validate_url``, so any range opened here is a range a hostile playlist can
+    read from the server's own network. Blocks link-local
+    (cloud metadata at 169.254.169.254), private (RFC1918), loopback,
+    unique-local and every other non-global range.
+    """
+    ips = _ips_to_judge(addr)
+    if not ips:
+        return False
+    return is_allowed_endpoint or all(ip.is_global for ip in ips)
+
+
+def _url_endpoint(url: str):
+    """Parse a configured URL into a ``(hostname, port)`` pair, or ``None`` if it
+    has no usable host. Used to scope the internal-address allowance to that
+    endpoint alone."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    candidate = url.strip()
+    if '://' not in candidate:
+        # Bare host:port, as accepted by the *_proxy environment variables.
+        candidate = '//' + candidate
+    try:
+        parts = urlsplit(candidate)
+        hostname, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    if port is None:
+        port = _SCHEME_DEFAULT_PORTS.get(parts.scheme.lower())
+    return (hostname.rstrip('.').lower(), port)
+
+
+def _endpoints(urls) -> set:
+    """The parseable endpoints among *urls*, dropping any that name no host."""
+    return {ep for ep in map(_url_endpoint, urls) if ep is not None}
+
+
+def _collect_proxy_endpoints(proxy_urls) -> set:
+    """Endpoints of every proxy this download may legitimately dial: the explicit
+    yt-dlp ``proxy`` option plus the ``*_proxy`` environment variables yt-dlp falls
+    back to. All are operator-configured, unlike the URLs inside fetched media."""
+    candidates = list(proxy_urls) + list(urllib.request.getproxies().values())
+    return _endpoints(candidates)
+
+
+def _proxy_scheme(proxy: str) -> str:
+    """The scheme of a configured proxy URL.
+
+    Defaults to ``http`` for the bare ``host:port`` form the ``*_proxy``
+    variables accept, which is the same default yt-dlp applies to them.
+    """
+    if not isinstance(proxy, str):
+        return ''
+    candidate = proxy.strip()
+    if '://' not in candidate:
+        return 'http' if candidate else ''
+    return urlsplit(candidate).scheme.lower()
+
+
+def download_proxies(ytdl_opts=None) -> dict:
+    """The proxy map a fetch will use, assembled as ``YoutubeDL.proxies`` does.
+
+    An explicit yt-dlp ``proxy`` option replaces the environment wholesale —
+    including any ``no_proxy`` exceptions — while without one the ``*_proxy``
+    variables apply as they stand. Mirrored rather than imported because
+    ``YoutubeDL.proxies`` is only reachable from a constructed instance, and
+    because this decides whether a security check runs: a quiet upstream change
+    should leave the check in place rather than silently skip it.
+    """
+    opts_proxy = (ytdl_opts or {}).get('proxy')
+    if opts_proxy is not None:
+        # '' means "no proxy, ignore the environment", which yt-dlp spells
+        # '__noproxy__' internally.
+        return {'all': opts_proxy or '__noproxy__'}
+    proxies = urllib.request.getproxies()
+    # compat, as in yt-dlp: http_proxy alone also covers https.
+    if 'http' in proxies and 'https' not in proxies:
+        proxies['https'] = proxies['http']
+    return proxies
+
+
+def _proxy_resolves_remotely(parts, proxies) -> bool:
+    """True when the proxy carrying this URL looks its hostname up itself.
+
+    Follows yt-dlp's ``select_proxy``: ``no_proxy`` exclusions first, then the
+    per-scheme entry, then the catch-all. Anything unrecognised answers False,
+    so an unparseable or unusual configuration keeps the address check.
+    """
+    if not proxies:
+        return False
+    hostname = parts.hostname
+    if not hostname:
+        return False
+    no_proxy = proxies.get('no')
+    if no_proxy:
+        hostport = hostname if parts.port is None else f'{hostname}:{parts.port}'
+        try:
+            if urllib.request.proxy_bypass_environment(hostport, {'no': no_proxy}):
+                return False
+        except (ValueError, UnicodeError):
+            return False
+    proxy = proxies.get(parts.scheme.lower()) or proxies.get('all')
+    if not proxy or proxy == '__noproxy__':
+        return False
+    return _proxy_scheme(proxy) in _REMOTE_DNS_PROXY_SCHEMES
+
+
+# Captured at import so re-installing the guard never wraps the wrapper.
+_real_getaddrinfo = socket.getaddrinfo
+
+# Populated by install_socket_guard; empty means no internal destination is allowed.
+_allowed_endpoints: set = set()
+
+# Set by socket_guard_scope for the thread it guards: that thread's allowed
+# endpoints. Unset means the thread is not in a scope.
+_thread_guard = threading.local()
+
+
+def _normalise_port(port):
+    if isinstance(port, str):
+        try:
+            return int(port)
+        except ValueError:
+            try:
+                return socket.getservbyname(port)
+            except OSError:
+                return None
+    return port
+
+
+def _is_allowed_endpoint(host, port) -> bool:
+    """True when host:port is exactly one of the endpoints this download is
+    configured to dial — a proxy or the PO token provider. Matching is on the
+    configured host *string*, not on the resolved address, so a hostile media URL
+    cannot borrow the allowance by resolving to the same address under a
+    different name."""
+    endpoints = getattr(_thread_guard, 'endpoints', None)
+    if endpoints is None:
+        endpoints = _allowed_endpoints
+    if not endpoints or host is None:
+        return False
+    return (str(host).rstrip('.').lower(), _normalise_port(port)) in endpoints
+
+
+def _guarded_getaddrinfo(host, *args, **kwargs):
+    results = _real_getaddrinfo(host, *args, **kwargs)
+    # Mirrors getaddrinfo(host, port, ...): port is the first optional argument.
+    port = args[0] if args else kwargs.get('port')
+    is_configured = _is_allowed_endpoint(host, port)
+    allowed = [r for r in results if _address_allowed_at_connect(r[4][0], is_configured)]
+    if not allowed:
+        raise socket.gaierror(f'Refusing to connect to non-global address for host {host!r}')
+    return allowed
+
+
+def _scoped_getaddrinfo(host, *args, **kwargs):
+    if getattr(_thread_guard, 'endpoints', None) is None:
+        return _real_getaddrinfo(host, *args, **kwargs)
+    return _guarded_getaddrinfo(host, *args, **kwargs)
+
+
+def _guard_endpoints(proxy_urls, service_urls) -> tuple[set, set]:
+    proxy_endpoints = _collect_proxy_endpoints(proxy_urls)
+    return proxy_endpoints, _endpoints(service_urls) - proxy_endpoints
+
+
+def install_socket_guard(allow_private: bool = False, proxy_urls=(), service_urls=()) -> None:
+    """Enforce the no-internal-hosts policy at actual connection time.
+
+    ``validate_url`` only checks the *submitted* URL string; yt-dlp then follows
+    HTTP redirects and resolves media URLs from remote metadata without
+    re-validating them. Installing this in the download subprocess re-checks
+    every resolved address at connect time, covering redirects, DNS rebinding and
+    manifest-derived media URLs for any networking backend that resolves through
+    Python's socket module (urllib, requests). Native resolvers — notably
+    curl_cffi/libcurl used by ``--impersonate`` — bypass this and rely on network
+    isolation as the backstop.
+
+    *proxy_urls* are the operator's configured proxies (yt-dlp's ``proxy`` option;
+    the ``*_proxy`` environment variables are picked up automatically), and
+    *service_urls* the helper services the download itself has to reach — the PO
+    token provider this image ships and starts on loopback. Each is reachable at
+    its own host:port wherever it lives — loopback, the LAN, a VPN range — and
+    nothing else internal is. That costs those setups nothing and gives away
+    little: yt-dlp dials each at exactly that host:port, and a media URL is either
+    handed to the proxy unresolved or resolved on its own merits — never
+    inheriting the allowance. A hostile media URL naming an allowed endpoint
+    reaches only what is listening there: a proxy that would have fetched it
+    anyway, or a token server with two endpoints and nothing to read.
+
+    When *allow_private* is set (``ALLOW_PRIVATE_ADDRESSES``), the guard is not
+    installed at all, so proxy/VPN setups that route through private or Fake-IP
+    ranges keep working.
+    """
+    if allow_private:
+        return
+    proxy_endpoints, service_endpoints = _guard_endpoints(proxy_urls, service_urls)
+    _allowed_endpoints.clear()
+    _allowed_endpoints.update(proxy_endpoints | service_endpoints)
+    for label, endpoints in (('proxy', proxy_endpoints), ('service', service_endpoints)):
+        for host, port in sorted(endpoints, key=lambda ep: (ep[0], ep[1] or 0)):
+            log.info(f'Allowing connections to configured {label} {host}:{port}')
+    socket.getaddrinfo = _guarded_getaddrinfo
+
+
+@contextlib.contextmanager
+def socket_guard_scope(allow_private: bool = False, proxy_urls=(), service_urls=()):
+    """``install_socket_guard`` for the calling thread only, while the block runs.
+
+    The main process can't take the process-wide guard (it would reject the
+    server's own bind on ``HOST=0.0.0.0``), but a fetch there whose response is
+    written to disk needs it just the same: an extractor-provided URL, or a
+    redirect from one, can lead to an internal host, and the response would land
+    in the download directory where ``/download`` serves it. yt-dlp resolves on
+    the thread that makes the request, so guarding that thread covers the fetch
+    and nothing else the server is doing. Arguments are as for
+    ``install_socket_guard``.
+    """
+    if allow_private:
+        yield
+        return
+    proxy_endpoints, service_endpoints = _guard_endpoints(proxy_urls, service_urls)
+    # Installed once and left in place: outside a scope it only passes through.
+    # A process that already has the full guard keeps it; that one reads the
+    # scope's endpoints too.
+    if socket.getaddrinfo is _real_getaddrinfo:
+        socket.getaddrinfo = _scoped_getaddrinfo
+    previous = getattr(_thread_guard, 'endpoints', None)
+    _thread_guard.endpoints = proxy_endpoints | service_endpoints
+    try:
+        yield
+    finally:
+        _thread_guard.endpoints = previous
+
+
+def validate_url(url: str, allow_private: bool = False, proxies: dict | None = None) -> str | None:
+    """Return an error message if the URL is disallowed, else ``None``.
+
+    Inputs without a ``://`` scheme separator (bare video IDs, ``ytsearch:``
+    and other yt-dlp search/extractor prefixes) are allowed unchanged so that
+    non-URL entries keep working.
+
+    When *allow_private* is set (``ALLOW_PRIVATE_ADDRESSES``), the internal-host
+    and internal-address checks are skipped so that trusted proxy/VPN setups —
+    e.g. Fake-IP clients that resolve YouTube to ``198.18.0.0/15`` — can be used.
+    Scheme validation (http/https only) still applies.
+
+    *proxies* is the proxy map the fetch will use (see ``download_proxies``).
+    When it routes this URL through a proxy that resolves hostnames itself, the
+    address check is skipped — see the comment at that branch for why.
+    """
+    if not isinstance(url, str):
+        return 'Invalid URL'
+
+    candidate = url.strip()
+    if '://' not in candidate:
+        # Not an absolute URL: bare video IDs, ytsearch: prefixes, etc.
+        return None
+
+    parts = urlsplit(candidate)
+    scheme = parts.scheme.lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        return f'URL scheme "{parts.scheme}" is not allowed (only http and https)'
+
+    hostname = parts.hostname
+    if not hostname:
+        return 'URL is missing a host'
+
+    if allow_private:
+        # Environment is explicitly trusted: skip the SSRF address checks.
+        return None
+
+    if _hostname_is_blocked(hostname):
+        return f'Refusing to fetch internal host "{hostname}"'
+
+    # A host written as an IP literal needs no lookup, so it is judged directly
+    # whatever the proxy setup: nothing leaves this process, and the address is
+    # exactly the one the request will name.
+    if _normalise_ip(hostname) is None and _proxy_resolves_remotely(parts, proxies):
+        # The proxy resolves this hostname on its own network, so a lookup here
+        # answers a different question than the one that matters, and asking it
+        # is itself the harm: it leaks the hostname of every queued URL to the
+        # local resolver, which is the single thing a SOCKS/Tor setup exists to
+        # prevent. It also fails closed against resolvers this process cannot
+        # reach — a container pointed at the proxy's own DNS port resolves
+        # nothing here and every add is refused. What the proxy's network
+        # exposes is the proxy's to police; the connect-time guard still holds
+        # everything that is dialled directly.
+        return None
+
+    try:
+        addrinfo = socket.getaddrinfo(hostname, parts.port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        # Fail closed: a host we cannot resolve is a host we cannot verify as
+        # non-internal, so refuse it rather than letting the download proceed
+        # to a target that may resolve differently at fetch time.
+        return f'Could not resolve host "{hostname}"'
+    except (UnicodeError, ValueError):
+        return f'Invalid host "{hostname}"'
+
+    for family, _type, _proto, _canonname, sockaddr in addrinfo:
+        addr = sockaddr[0]
+        if not _address_is_global(addr):
+            return f'Refusing to fetch internal address "{addr}" for host "{hostname}"'
+
+    return None
