@@ -1,32 +1,27 @@
 import os
 import shutil
 import yt_dlp
+import collections
+import collections.abc
+import copy
+import pickle
 from collections import OrderedDict
-import shelve
 import time
 import asyncio
 import multiprocessing
 import logging
 import re
 import types
-import dbm
-import subprocess
-from typing import Any
-from functools import lru_cache
+from typing import Any, Optional
 
 import yt_dlp.networking.impersonate
 from yt_dlp.utils import STR_FORMAT_RE_TMPL, STR_FORMAT_TYPES
 from dl_formats import get_format, get_opts, AUDIO_FORMATS
 from datetime import datetime
+from state_store import AtomicJsonStore, from_json_compatible, read_legacy_shelf, to_json_compatible
+from subscriptions import _entry_id
 
 log = logging.getLogger('ytdl')
-
-
-@lru_cache(maxsize=None)
-def _compile_outtmpl_pattern(field: str) -> re.Pattern:
-    """Compile a regex pattern to match a specific field in an output template, including optional format specifiers."""
-    conversion_types = f"[{re.escape(STR_FORMAT_TYPES)}]"
-    return re.compile(STR_FORMAT_RE_TMPL.format(re.escape(field), conversion_types))
 
 
 # Characters that are invalid in Windows/NTFS path components. These are pre-
@@ -39,55 +34,86 @@ def _sanitize_path_component(value: Any) -> Any:
     """Replace characters that are invalid in Windows path components with '_'.
 
     Non-string values (int, float, None, …) are passed through unchanged so
-    that ``_outtmpl_substitute_field`` can still coerce them with format specs
-    (e.g. ``%(playlist_index)02d``).  Only string values are sanitised because
-    Windows-invalid characters are only a concern for human-readable strings
-    (titles, channel names, etc.) that may end up as directory names.
+    that numeric format specs (e.g. ``%(playlist_index)02d``) still work.
+    Only string values are sanitised because Windows-invalid characters are
+    only a concern for human-readable strings (titles, channel names, etc.)
+    that may end up as directory names.
     """
     if not isinstance(value, str):
         return value
     return _WINDOWS_INVALID_PATH_CHARS.sub('_', value)
 
 
-def _outtmpl_substitute_field(template: str, field: str, value: Any) -> str:
-    """Substitute a single field in an output template, applying any format specifiers to the value."""
-    pattern = _compile_outtmpl_pattern(field)
+# Regex matching yt-dlp output-template field references, e.g. ``%(title)s``
+# or ``%(playlist_index)03d``.  Built from yt-dlp's own ``STR_FORMAT_RE_TMPL``
+# so that it stays in sync with upstream changes to the template syntax.
+_OUTTMPL_FIELD_RE = re.compile(
+    STR_FORMAT_RE_TMPL.format('[^)]+', f'[{STR_FORMAT_TYPES}ljhqBUDS]')
+)
 
-    def replacement(match: re.Match) -> str:
-        if match.group("has_key") is None:
-            return match.group(0)
 
-        prefix = match.group("prefix") or ""
-        format_spec = match.group("format")
+def _resolve_outtmpl_fields(template: str, info_dict: dict, prefixes: tuple[str, ...]) -> str:
+    """Resolve specific fields in an output template using yt-dlp's template engine.
 
-        if not format_spec:
-            return f"{prefix}{value}"
+    Only field references whose root name starts with one of *prefixes* are
+    evaluated.  All other references are left untouched so that yt-dlp can
+    resolve them later during the actual download.
 
-        conversion_type = format_spec[-1]
-        try:
-            if conversion_type in "diouxX":
-                coerced_value = int(value)
-            elif conversion_type in "eEfFgG":
-                coerced_value = float(value)
-            else:
-                coerced_value = value
+    This delegates to ``YoutubeDL.evaluate_outtmpl`` for each targeted field
+    reference, giving access to the full yt-dlp template syntax (defaults,
+    conditional formatting, math operations, datetime formatting, etc.).
+    """
+    matches = list(_OUTTMPL_FIELD_RE.finditer(template))
+    if not matches:
+        return template
 
-            return f"{prefix}{('%' + format_spec) % coerced_value}"
-        except (ValueError, TypeError):
-            return f"{prefix}{value}"
+    with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        for match in reversed(matches):
+            key = match.group('key')
+            if key is None:
+                continue
+            root = re.match(r'\w+', key)
+            if root is None or not root.group(0).startswith(prefixes):
+                continue
+            resolved = ydl.evaluate_outtmpl(match.group(0), info_dict)
+            template = template[:match.start()] + resolved + template[match.end():]
 
-    return pattern.sub(replacement, template)
+    return template
 
-def _convert_generators_to_lists(obj):
-    """Recursively convert generators to lists in a dictionary to make it pickleable."""
-    if isinstance(obj, types.GeneratorType):
-        return list(obj)
-    elif isinstance(obj, dict):
-        return {k: _convert_generators_to_lists(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return type(obj)(_convert_generators_to_lists(item) for item in obj)
-    else:
+_MAX_ENTRY_SANITIZE_DEPTH = 64
+
+
+def _sanitize_entry_for_pickle(obj, _depth=0):
+    """Recursively normalize yt-dlp ``info_dict`` data so it can be stored in shelve/pickle.
+
+    Live streams and newer yt-dlp versions may nest generators, iterators, sets, or
+    non-serializable objects (e.g. locks) inside the extracted metadata. The previous
+    helper only walked plain dict/list/tuple and only expanded ``types.GeneratorType``.
+    """
+    if _depth > _MAX_ENTRY_SANITIZE_DEPTH:
+        return None
+    if obj is None or isinstance(obj, (bool, int, float, str, bytes)):
         return obj
+    if isinstance(obj, types.GeneratorType):
+        return _sanitize_entry_for_pickle(list(obj), _depth + 1)
+    if isinstance(obj, collections.abc.Mapping):
+        return {k: _sanitize_entry_for_pickle(v, _depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_sanitize_entry_for_pickle(x, _depth + 1) for x in obj)
+    if isinstance(obj, (set, frozenset)):
+        return [_sanitize_entry_for_pickle(x, _depth + 1) for x in obj]
+    if isinstance(obj, collections.deque):
+        return [_sanitize_entry_for_pickle(x, _depth + 1) for x in obj]
+    if isinstance(obj, collections.abc.Iterator):
+        try:
+            return _sanitize_entry_for_pickle(list(obj), _depth + 1)
+        except Exception:
+            return None
+    try:
+        pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        return obj
+    except Exception:
+        return None
 
 
 def _convert_srt_to_txt_file(subtitle_path: str):
@@ -150,8 +176,9 @@ class DownloadInfo:
         id,
         title,
         url,
-        extractor,
         quality,
+        download_type,
+        codec,
         format,
         folder,
         custom_name_prefix,
@@ -160,15 +187,19 @@ class DownloadInfo:
         playlist_item_limit,
         split_by_chapters,
         chapter_template,
-        subtitle_format="srt",
         subtitle_language="en",
         subtitle_mode="prefer_manual",
+        ytdl_options_presets=None,
+        ytdl_options_overrides=None,
+        extractor=None,
     ):
         self.id = id if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
         self.title = title if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
         self.url = url
         self.extractor = extractor
         self.quality = quality
+        self.download_type = download_type
+        self.codec = codec
         self.format = format
         self.folder = folder
         self.custom_name_prefix = custom_name_prefix
@@ -177,18 +208,172 @@ class DownloadInfo:
         self.size = None
         self.timestamp = time.time_ns()
         self.error = error
-        # Convert generators to lists to make entry pickleable
-        self.entry = _convert_generators_to_lists(entry) if entry is not None else None
+        # Strip non-pickleable values (generators, iterators, locks, etc.) for shelve
+        self.entry = _sanitize_entry_for_pickle(entry) if entry is not None else None
         self.playlist_item_limit = playlist_item_limit
         self.split_by_chapters = split_by_chapters
         self.chapter_template = chapter_template
-        self.subtitle_format = subtitle_format
         self.subtitle_language = subtitle_language
         self.subtitle_mode = subtitle_mode
+        self.ytdl_options_presets = list(ytdl_options_presets or [])
+        self.ytdl_options_overrides = dict(ytdl_options_overrides or {})
         self.subtitle_files = []
+
+    def __setstate__(self, state):
+        """BACKWARD COMPATIBILITY: migrate old DownloadInfo from persistent queue files."""
+        self.__dict__.update(state)
+        if 'download_type' not in state:
+            old_format = state.get('format', 'any')
+            old_video_codec = state.get('video_codec', 'auto')
+            old_quality = state.get('quality', 'best')
+            old_subtitle_format = state.get('subtitle_format', 'srt')
+
+            if old_format in AUDIO_FORMATS:
+                self.download_type = 'audio'
+                self.codec = 'auto'
+            elif old_format == 'thumbnail':
+                self.download_type = 'thumbnail'
+                self.codec = 'auto'
+                self.format = 'jpg'
+            elif old_format == 'captions':
+                self.download_type = 'captions'
+                self.codec = 'auto'
+                self.format = old_subtitle_format
+            else:
+                self.download_type = 'video'
+                self.codec = old_video_codec
+                if old_quality == 'best_ios':
+                    self.format = 'ios'
+                    self.quality = 'best'
+                elif old_quality == 'audio':
+                    self.download_type = 'audio'
+                    self.codec = 'auto'
+                    self.format = 'm4a'
+                    self.quality = 'best'
+            self.__dict__.pop('video_codec', None)
+            self.__dict__.pop('subtitle_format', None)
+
+        if not getattr(self, "codec", None):
+            self.codec = "auto"
+        if not hasattr(self, "folder"):
+            self.folder = ""
+        if not hasattr(self, "custom_name_prefix"):
+            self.custom_name_prefix = ""
+        if not hasattr(self, "playlist_item_limit"):
+            self.playlist_item_limit = 0
+        if not hasattr(self, "split_by_chapters"):
+            self.split_by_chapters = False
+        if not hasattr(self, "chapter_template"):
+            self.chapter_template = ""
+        if not hasattr(self, "subtitle_language"):
+            self.subtitle_language = "en"
+        if not hasattr(self, "subtitle_mode"):
+            self.subtitle_mode = "prefer_manual"
+        legacy_preset = self.__dict__.pop("ytdl_options_preset", None)
+        if "ytdl_options_presets" not in self.__dict__:
+            if isinstance(legacy_preset, str) and legacy_preset.strip():
+                self.ytdl_options_presets = [legacy_preset.strip()]
+            elif isinstance(legacy_preset, list):
+                self.ytdl_options_presets = [str(x).strip() for x in legacy_preset if str(x).strip()]
+            else:
+                self.ytdl_options_presets = []
+        if not hasattr(self, "ytdl_options_overrides"):
+            self.ytdl_options_overrides = {}
+        if not hasattr(self, "entry"):
+            self.entry = None
+        if not hasattr(self, "subtitle_files"):
+            self.subtitle_files = []
+        if not hasattr(self, "chapter_files"):
+            self.chapter_files = []
+
+
+_PERSISTED_DOWNLOAD_FIELDS = (
+    "id",
+    "title",
+    "url",
+    "extractor",
+    "quality",
+    "download_type",
+    "codec",
+    "format",
+    "folder",
+    "custom_name_prefix",
+    "playlist_item_limit",
+    "split_by_chapters",
+    "chapter_template",
+    "subtitle_language",
+    "subtitle_mode",
+    "ytdl_options_presets",
+    "ytdl_options_overrides",
+    "status",
+    "timestamp",
+    "error",
+    "msg",
+    "filename",
+    "size",
+    "chapter_files",
+)
+
+
+_COMPACT_ENTRY_EXTRA_KEYS = frozenset(("n_entries", "__last_playlist_index"))
+
+
+def _compact_persisted_entry(entry: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(entry, dict):
+        return None
+    compact = {
+        key: value
+        for key, value in entry.items()
+        if key.startswith("playlist") or key.startswith("channel") or key in _COMPACT_ENTRY_EXTRA_KEYS
+    }
+    return compact or None
+
+
+def _download_info_to_record(
+    info: DownloadInfo,
+    *,
+    include_entry: bool,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {}
+    for key in _PERSISTED_DOWNLOAD_FIELDS:
+        if hasattr(info, key):
+            value = getattr(info, key)
+            if value is not None:
+                record[key] = to_json_compatible(value)
+    if include_entry:
+        compact_entry = _compact_persisted_entry(getattr(info, "entry", None))
+        if compact_entry is not None:
+            record["entry"] = to_json_compatible(compact_entry)
+    return record
+
+
+def _download_info_from_record(record: dict[str, Any]) -> DownloadInfo:
+    info = DownloadInfo.__new__(DownloadInfo)
+    info.__setstate__({key: from_json_compatible(value) for key, value in record.items()})
+    if not hasattr(info, "msg"):
+        info.msg = None
+    if not hasattr(info, "percent"):
+        info.percent = None
+    if not hasattr(info, "speed"):
+        info.speed = None
+    if not hasattr(info, "eta"):
+        info.eta = None
+    if not hasattr(info, "status"):
+        info.status = "pending"
+    if not hasattr(info, "size"):
+        info.size = None
+    if not hasattr(info, "error"):
+        info.error = None
+    return info
 
 class Download:
     manager = None
+
+    @classmethod
+    def shutdown_manager(cls):
+        if cls.manager is not None:
+            cls.manager.shutdown()
+            cls.manager = None
 
     def __init__(self, download_dir, temp_dir, output_template, output_template_chapter, quality, format, ytdl_opts, info):
         self.download_dir = download_dir
@@ -196,12 +381,18 @@ class Download:
         self.output_template = output_template
         self.output_template_chapter = output_template_chapter
         self.info = info
-        self.format = get_format(format, quality)
+        self.format = get_format(
+            getattr(info, 'download_type', 'video'),
+            getattr(info, 'codec', 'auto'),
+            format,
+            quality,
+        )
         self.ytdl_opts = get_opts(
+            getattr(info, 'download_type', 'video'),
+            getattr(info, 'codec', 'auto'),
             format,
             quality,
             ytdl_opts,
-            subtitle_format=getattr(info, 'subtitle_format', 'srt'),
             subtitle_language=getattr(info, 'subtitle_language', 'en'),
             subtitle_mode=getattr(info, 'subtitle_mode', 'prefer_manual'),
         )
@@ -243,7 +434,7 @@ class Download:
                     # For captions-only downloads, yt-dlp may still report a media-like
                     # filepath in MoveFiles. Capture subtitle outputs explicitly so the
                     # UI can link to real caption files.
-                    if self.info.format == 'captions':
+                    if getattr(self.info, 'download_type', '') == 'captions':
                         requested_subtitles = d.get('info_dict', {}).get('requested_subtitles', {}) or {}
                         for subtitle in requested_subtitles.values():
                             if isinstance(subtitle, dict) and subtitle.get('filepath'):
@@ -351,14 +542,14 @@ class Download:
                 rel_name = os.path.relpath(fileName, self.download_dir)
                 # For captions mode, ignore media-like placeholders and let subtitle_file
                 # statuses define the final file shown in the UI.
-                if self.info.format == 'captions':
-                    requested_subtitle_format = str(getattr(self.info, 'subtitle_format', '')).lower()
+                if getattr(self.info, 'download_type', '') == 'captions':
+                    requested_subtitle_format = str(getattr(self.info, 'format', '')).lower()
                     allowed_caption_exts = ('.txt',) if requested_subtitle_format == 'txt' else ('.vtt', '.srt', '.sbv', '.scc', '.ttml', '.dfxp')
                     if not rel_name.lower().endswith(allowed_caption_exts):
                         continue
                 self.info.filename = rel_name
                 self.info.size = os.path.getsize(fileName) if os.path.exists(fileName) else None
-                if self.info.format == 'thumbnail':
+                if getattr(self.info, 'download_type', '') == 'thumbnail':
                     self.info.filename = re.sub(r'\.webm$', '.jpg', self.info.filename)
 
             # Handle chapter files
@@ -383,7 +574,7 @@ class Download:
                 subtitle_output_file = subtitle_file
 
                 # txt mode is derived from SRT by stripping cue metadata.
-                if self.info.format == 'captions' and str(getattr(self.info, 'subtitle_format', '')).lower() == 'txt':
+                if getattr(self.info, 'download_type', '') == 'captions' and str(getattr(self.info, 'format', '')).lower() == 'txt':
                     converted_txt = _convert_srt_to_txt_file(subtitle_file)
                     if converted_txt:
                         subtitle_output_file = converted_txt
@@ -399,9 +590,9 @@ class Download:
                 if not existing:
                     self.info.subtitle_files.append({'filename': rel_path, 'size': file_size})
                 # Prefer first subtitle file as the primary result link in captions mode.
-                if self.info.format == 'captions' and (
+                if getattr(self.info, 'download_type', '') == 'captions' and (
                     not getattr(self.info, 'filename', None) or
-                    str(getattr(self.info, 'subtitle_format', '')).lower() == 'txt'
+                    str(getattr(self.info, 'format', '')).lower() == 'txt'
                 ):
                     self.info.filename = rel_path
                     self.info.size = file_size
@@ -424,16 +615,14 @@ class PersistentQueue:
         pdir = os.path.dirname(path)
         if not os.path.isdir(pdir):
             os.mkdir(pdir)
-        with shelve.open(path, 'c'):
-            pass
-
-        self.path = path
-        self.repair()
+        self.legacy_path = path
+        self.path = f"{path}.json"
+        self.store = AtomicJsonStore(self.path, kind=f"persistent_queue:{name}")
         self.dict = OrderedDict()
 
     def load(self):
         for k, v in self.saved_items():
-            self.dict[k] = Download(None, None, None, None, None, None, {}, v)
+            self.dict[k] = Download(None, None, None, None, getattr(v, 'quality', 'best'), getattr(v, 'format', 'any'), {}, v)
 
     def exists(self, key):
         return key in self.dict
@@ -445,20 +634,91 @@ class PersistentQueue:
         return self.dict.items()
 
     def saved_items(self):
-        with shelve.open(self.path, 'r') as shelf:
-            return sorted(shelf.items(), key=lambda item: item[1].timestamp)
+        items = [
+            (item["key"], _download_info_from_record(item["info"]))
+            for item in self._load_state_items()
+        ]
+        return sorted(items, key=lambda item: item[1].timestamp)
+
+    def _should_persist_entry(self) -> bool:
+        return self.identifier != "completed"
+
+    def _serialize_items(self):
+        return [
+            {
+                "key": key,
+                "info": _download_info_to_record(
+                    download.info,
+                    include_entry=self._should_persist_entry(),
+                ),
+            }
+            for key, download in self.dict.items()
+        ]
+
+    def _save_dict(self):
+        self.store.save({"items": self._serialize_items()})
+
+    def _load_state_items(self):
+        payload = self.store.load()
+        if payload is not None:
+            items = payload.get("items")
+            if isinstance(items, list):
+                compact_items = [
+                    {
+                        "key": item["key"],
+                        "info": _download_info_to_record(
+                            _download_info_from_record(item["info"]),
+                            include_entry=self._should_persist_entry(),
+                        ),
+                    }
+                    for item in items
+                    if isinstance(item, dict) and "key" in item and "info" in item
+                ]
+                if payload.get("schema_version") != self.store.schema_version or compact_items != items:
+                    self.store.save({"items": compact_items})
+                return compact_items
+            log.warning("PersistentQueue:%s state file did not contain an items list", self.identifier)
+            return []
+
+        legacy_items = read_legacy_shelf(self.legacy_path)
+        if legacy_items is None:
+            return []
+
+        items = [
+            {
+                "key": key,
+                "info": _download_info_to_record(
+                    value,
+                    include_entry=self._should_persist_entry(),
+                ),
+            }
+            for key, value in sorted(legacy_items, key=lambda item: item[1].timestamp)
+        ]
+        self.store.save({"items": items})
+        return items
 
     def put(self, value):
         key = value.info.url
+        old = self.dict.get(key)
         self.dict[key] = value
-        with shelve.open(self.path, 'w') as shelf:
-            shelf[key] = value.info
+        try:
+            self._save_dict()
+        except Exception:
+            if old is None:
+                del self.dict[key]
+            else:
+                self.dict[key] = old
+            raise
 
     def delete(self, key):
         if key in self.dict:
+            old = self.dict[key]
             del self.dict[key]
-            with shelve.open(self.path, 'w') as shelf:
-                shelf.pop(key, None)
+            try:
+                self._save_dict()
+            except Exception:
+                self.dict[key] = old
+                raise
 
     def next(self):
         k, v = next(iter(self.dict.items()))
@@ -466,77 +726,6 @@ class PersistentQueue:
 
     def empty(self):
         return not bool(self.dict)
-
-    def repair(self):
-        # check DB format
-        type_check = subprocess.run(
-            ["file", self.path],
-            capture_output=True,
-            text=True
-        )
-        db_type = type_check.stdout.lower()
-
-        # create backup (<queue>.old)
-        try:
-            shutil.copy2(self.path, f"{self.path}.old")
-        except Exception as e:
-            # if we cannot backup then its not safe to attempt a repair
-            #  since it could be due to a filesystem error
-            log.debug(f"PersistentQueue:{self.identifier} backup failed, skipping repair")
-            return
-
-        if "gnu dbm" in db_type:
-            # perform gdbm repair
-            log_prefix = f"PersistentQueue:{self.identifier} repair (dbm/file)"
-            log.debug(f"{log_prefix} started")
-            try:
-                result = subprocess.run(
-                    ["gdbmtool", self.path],
-                    input="recover verbose summary\n",
-                    text=True,
-                    capture_output=True,
-                    timeout=60
-                )
-                log.debug(f"{log_prefix} {result.stdout}")
-                if result.stderr:
-                    log.debug(f"{log_prefix} failed: {result.stderr}")
-            except FileNotFoundError:
-                log.debug(f"{log_prefix} failed: 'gdbmtool' was not found")
-
-            # perform null key cleanup
-            log_prefix = f"PersistentQueue:{self.identifier} repair (null keys)"
-            log.debug(f"{log_prefix} started")
-            deleted = 0
-            try:
-                with dbm.open(self.path, "w") as db:
-                    for key in list(db.keys()):
-                        if len(key) > 0 and all(b == 0x00 for b in key):
-                            log.debug(f"{log_prefix} deleting key of length {len(key)} (all NUL bytes)")
-                            del db[key]
-                            deleted += 1
-                log.debug(f"{log_prefix} done - deleted {deleted} key(s)")
-            except dbm.error:
-                log.debug(f"{log_prefix} failed: db type is dbm.gnu, but the module is not available (dbm.error; module support may be missing or the file may be corrupted)")
-
-        elif "sqlite" in db_type:
-            # perform sqlite3 recovery
-            log_prefix = f"PersistentQueue:{self.identifier} repair (sqlite3/file)"
-            log.debug(f"{log_prefix} started")
-            try:
-                result = subprocess.run(
-                    f"sqlite3 {self.path} '.recover' | sqlite3 {self.path}.tmp",
-                    capture_output=True,
-                    text=True,
-                    shell=True,
-                    timeout=60
-                )
-                if result.stderr:
-                    log.debug(f"{log_prefix} failed: {result.stderr}")
-                else:
-                    shutil.move(f"{self.path}.tmp", self.path)
-                    log.debug(f"{log_prefix}{result.stdout or " was successful, no output"}")
-            except FileNotFoundError:
-                log.debug(f"{log_prefix} failed: 'sqlite3' was not found")
 
 class DownloadQueue:
     def __init__(self, config, notifier):
@@ -584,7 +773,7 @@ class DownloadQueue:
             if download.tmpfilename and os.path.isfile(download.tmpfilename):
                 try:
                     os.remove(download.tmpfilename)
-                except:
+                except OSError:
                     pass
             download.info.status = 'error'
         download.close()
@@ -626,8 +815,8 @@ class DownloadQueue:
             **({'impersonate': yt_dlp.networking.impersonate.ImpersonateTarget.from_str(self.config.YTDL_OPTIONS['impersonate'])} if 'impersonate' in self.config.YTDL_OPTIONS else {}),
         }).extract_info(url, download=False)
 
-    def __calc_download_path(self, quality, format, folder):
-        base_directory = self.config.DOWNLOAD_DIR if (quality != 'audio' and format not in AUDIO_FORMATS) else self.config.AUDIO_DOWNLOAD_DIR
+    def __calc_download_path(self, download_type, folder):
+        base_directory = self.config.AUDIO_DOWNLOAD_DIR if download_type == 'audio' else self.config.DOWNLOAD_DIR
         if folder:
             if not self.config.CUSTOM_DIRS:
                 return None, {'status': 'error', 'msg': 'A folder for the download was specified but CUSTOM_DIRS is not true in the configuration.'}
@@ -644,7 +833,7 @@ class DownloadQueue:
         return dldirectory, None
 
     async def __add_download(self, dl, auto_start, bypass_archive):
-        dldirectory, error_message = self.__calc_download_path(dl.quality, dl.format, dl.folder)
+        dldirectory, error_message = self.__calc_download_path(dl.download_type, dl.folder)
         if error_message is not None:
             return error_message
         output = self.config.OUTPUT_TEMPLATE if len(dl.custom_name_prefix) == 0 else f'{dl.custom_name_prefix}.{self.config.OUTPUT_TEMPLATE}'
@@ -653,18 +842,19 @@ class DownloadQueue:
         if entry is not None and entry.get('playlist_index') is not None:
             if len(self.config.OUTPUT_TEMPLATE_PLAYLIST):
                 output = self.config.OUTPUT_TEMPLATE_PLAYLIST
-            for property, value in entry.items():
-                if property.startswith("playlist"):
-                    output = _outtmpl_substitute_field(output, property, _sanitize_path_component(value))
+            sanitized = {k: _sanitize_path_component(v) for k, v in entry.items()}
+            output = _resolve_outtmpl_fields(output, sanitized, ('playlist',))
         if entry is not None and entry.get('channel_index') is not None:
             if len(self.config.OUTPUT_TEMPLATE_CHANNEL):
                 output = self.config.OUTPUT_TEMPLATE_CHANNEL
-            for property, value in entry.items():
-                if property.startswith("channel"):
-                    output = _outtmpl_substitute_field(output, property, _sanitize_path_component(value))
+            sanitized = {k: _sanitize_path_component(v) for k, v in entry.items()}
+            output = _resolve_outtmpl_fields(output, sanitized, ('channel',))
         ytdl_options = dict(self.config.YTDL_OPTIONS)
-        if(self.config.ARCHIVE_FILE and not bypass_archive):
+        if self.config.ARCHIVE_FILE and not bypass_archive:
             ytdl_options['download_archive'] = self.config.ARCHIVE_FILE
+        for preset_name in getattr(dl, 'ytdl_options_presets', None) or []:
+            ytdl_options.update(self.config.YTDL_OPTIONS_PRESETS.get(preset_name, {}))
+        ytdl_options.update(getattr(dl, 'ytdl_options_overrides', {}) or {})
         playlist_item_limit = getattr(dl, 'playlist_item_limit', 0)
         if playlist_item_limit > 0:
             log.info(f'playlist limit is set. Processing only first {playlist_item_limit} entries')
@@ -680,20 +870,24 @@ class DownloadQueue:
     async def __add_entry(
         self,
         entry,
-        quality,
+        download_type,
+        codec,
         format,
+        quality,
         folder,
         custom_name_prefix,
         playlist_item_limit,
         auto_start,
-        bypass_archive,
         split_by_chapters,
         chapter_template,
-        subtitle_format,
         subtitle_language,
         subtitle_mode,
+        ytdl_options_presets,
+        ytdl_options_overrides,
         already,
         _add_gen=None,
+        *,
+        bypass_archive=False,
     ):
         if not entry:
             return {'status': 'error', 'msg': "Invalid/empty data was given."}
@@ -712,20 +906,23 @@ class DownloadQueue:
             log.debug('Processing as a url')
             return await self.add(
                 entry['url'],
-                quality,
+                download_type,
+                codec,
                 format,
+                quality,
                 folder,
                 custom_name_prefix,
                 playlist_item_limit,
                 auto_start,
-                bypass_archive,
                 split_by_chapters,
                 chapter_template,
-                subtitle_format,
                 subtitle_language,
                 subtitle_mode,
+                ytdl_options_presets,
+                ytdl_options_overrides,
                 already,
                 _add_gen,
+                bypass_archive=bypass_archive,
             )
         elif etype == 'playlist' or etype == 'channel':
             log.debug(f'Processing as a {etype}')
@@ -733,8 +930,9 @@ class DownloadQueue:
             # Convert generator to list if needed (for len() and slicing operations)
             if isinstance(entries, types.GeneratorType):
                 entries = list(entries)
-            log.info(f'{etype} detected with {len(entries)} entries')
-            index_digits = len(str(len(entries)))
+            total_entries = len(entries)
+            log.info(f'{etype} detected with {total_entries} entries')
+            index_digits = len(str(total_entries))
             results = []
             if playlist_item_limit > 0:
                 log.info(f'Item limit is set. Processing only first {playlist_item_limit} entries')
@@ -743,29 +941,40 @@ class DownloadQueue:
                 if _add_gen is not None and self._add_generation != _add_gen:
                     log.info(f'Playlist add canceled after processing {len(already)} entries')
                     return {'status': 'ok', 'msg': f'Canceled - added {len(already)} items before cancel'}
+                if "id" not in etr:
+                    etr["id"] = _entry_id(etr)
                 etr["_type"] = "video"
                 etr[etype] = entry.get("id") or entry.get("channel_id") or entry.get("channel")
                 etr[f"{etype}_index"] = '{{0:0{0:d}d}}'.format(index_digits).format(index)
+                etr[f"{etype}_count"] = total_entries
+                etr[f"{etype}_autonumber"] = index
+                # n_entries: standard yt-dlp field for total count (used by template engine)
+                # __last_playlist_index: yt-dlp internal field for auto-padding autonumber
+                etr["n_entries"] = total_entries
+                etr["__last_playlist_index"] = total_entries
                 for property in ("id", "title", "uploader", "uploader_id"):
                     if property in entry:
                         etr[f"{etype}_{property}"] = entry[property]
                 results.append(
                     await self.__add_entry(
                         etr,
-                        quality,
+                        download_type,
+                        codec,
                         format,
+                        quality,
                         folder,
                         custom_name_prefix,
                         playlist_item_limit,
                         auto_start,
-                        bypass_archive,
                         split_by_chapters,
                         chapter_template,
-                        subtitle_format,
                         subtitle_language,
                         subtitle_mode,
+                        ytdl_options_presets,
+                        ytdl_options_overrides,
                         already,
                         _add_gen,
+                        bypass_archive=bypass_archive,
                     )
                 )
             if any(res['status'] == 'error' for res in results):
@@ -779,22 +988,25 @@ class DownloadQueue:
                 return {'status': 'ok'}
             if not self.queue.exists(key):
                 dl = DownloadInfo(
-                    entry['id'],
-                    entry.get('title') or entry['id'],
-                    key,
-                    entry['extractor_key'].lower(),
-                    quality,
-                    format,
-                    folder,
-                    custom_name_prefix,
-                    error,
-                    entry,
-                    playlist_item_limit,
-                    split_by_chapters,
-                    chapter_template,
-                    subtitle_format,
-                    subtitle_language,
-                    subtitle_mode,
+                    id=entry['id'],
+                    title=entry.get('title') or entry['id'],
+                    url=key,
+                    extractor=(entry.get('extractor_key') or entry.get('ie_key') or '').lower() or None,
+                    quality=quality,
+                    download_type=download_type,
+                    codec=codec,
+                    format=format,
+                    folder=folder,
+                    custom_name_prefix=custom_name_prefix,
+                    error=error,
+                    entry=entry,
+                    playlist_item_limit=playlist_item_limit,
+                    split_by_chapters=split_by_chapters,
+                    chapter_template=chapter_template,
+                    subtitle_language=subtitle_language,
+                    subtitle_mode=subtitle_mode,
+                    ytdl_options_presets=ytdl_options_presets,
+                    ytdl_options_overrides=ytdl_options_overrides,
                 )
                 await self.__add_download(dl, auto_start, bypass_archive)
             return {'status': 'ok'}
@@ -803,25 +1015,31 @@ class DownloadQueue:
     async def add(
         self,
         url,
-        quality,
+        download_type,
+        codec,
         format,
+        quality,
         folder,
         custom_name_prefix,
         playlist_item_limit,
         auto_start=True,
-         bypass_archive=False,
         split_by_chapters=False,
         chapter_template=None,
-        subtitle_format="srt",
         subtitle_language="en",
         subtitle_mode="prefer_manual",
+        ytdl_options_presets=None,
+        ytdl_options_overrides=None,
         already=None,
         _add_gen=None,
+        *,
+        bypass_archive=False,
     ):
+        if ytdl_options_presets is None:
+            ytdl_options_presets = []
         log.info(
-            f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=} '
+            f'adding {url}: {download_type=} {codec=} {format=} {quality=} {already=} {folder=} {custom_name_prefix=} '
             f'{playlist_item_limit=} {auto_start=} {bypass_archive=} {split_by_chapters=} {chapter_template=} '
-            f'{subtitle_format=} {subtitle_language=} {subtitle_mode=}'
+            f'{subtitle_language=} {subtitle_mode=} {ytdl_options_presets=}'
         )
         if already is None:
             _add_gen = self._add_generation
@@ -840,26 +1058,74 @@ class DownloadQueue:
             return {'status': 'error', 'msg': str(exc)}
         return await self.__add_entry(
             entry,
-            quality,
+            download_type,
+            codec,
             format,
+            quality,
             folder,
             custom_name_prefix,
             playlist_item_limit,
             auto_start,
-            bypass_archive,
             split_by_chapters,
             chapter_template,
-            subtitle_format,
             subtitle_language,
             subtitle_mode,
+            ytdl_options_presets,
+            ytdl_options_overrides,
             already,
             _add_gen,
+            bypass_archive=bypass_archive,
+        )
+
+    async def add_entry(
+        self,
+        entry,
+        download_type,
+        codec,
+        format,
+        quality,
+        folder,
+        custom_name_prefix,
+        playlist_item_limit,
+        auto_start=True,
+        split_by_chapters=False,
+        chapter_template=None,
+        subtitle_language="en",
+        subtitle_mode="prefer_manual",
+        ytdl_options_presets=None,
+        ytdl_options_overrides=None,
+        *,
+        bypass_archive=False,
+    ):
+        if ytdl_options_presets is None:
+            ytdl_options_presets = []
+        normalized_entry = copy.deepcopy(entry) if isinstance(entry, dict) else entry
+        already = set()
+        return await self.__add_entry(
+            normalized_entry,
+            download_type,
+            codec,
+            format,
+            quality,
+            folder,
+            custom_name_prefix,
+            playlist_item_limit,
+            auto_start,
+            split_by_chapters,
+            chapter_template,
+            subtitle_language,
+            subtitle_mode,
+            ytdl_options_presets,
+            ytdl_options_overrides,
+            already,
+            None,
+            bypass_archive=bypass_archive,
         )
 
     async def start_pending(self, ids):
         for id in ids:
             if not self.pending.exists(id):
-                log.warn(f'requested start for non-existent download {id}')
+                log.warning(f'requested start for non-existent download {id}')
                 continue
             dl = self.pending.get(id)
             self.queue.put(dl)
@@ -876,7 +1142,7 @@ class DownloadQueue:
                 await self.notifier.canceled(id)
                 continue
             if not self.queue.exists(id):
-                log.warn(f'requested cancel for non-existent download {id}')
+                log.warning(f'requested cancel for non-existent download {id}')
                 continue
             if self.queue.get(id).started():
                 self.queue.get(id).cancel()
@@ -885,19 +1151,19 @@ class DownloadQueue:
                 await self.notifier.canceled(id)
         return {'status': 'ok'}
 
-    async def clear(self, ids, deleteFile):
+    async def clear(self, ids, deleteFile=False):
         for id in ids:
             if not self.done.exists(id):
-                log.warn(f'requested delete for non-existent download {id}')
+                log.warning(f'requested delete for non-existent download {id}')
                 continue
             if self.config.DELETE_FILE_ON_TRASHCAN and deleteFile:
                 dl = self.done.get(id)
                 try:
-                    dldirectory, _ = self.__calc_download_path(dl.info.quality, dl.info.format, dl.info.folder)
+                    dldirectory, _ = self.__calc_download_path(dl.info.download_type, dl.info.folder)
                     os.remove(os.path.join(dldirectory, dl.info.filename))
                 except Exception as e:
-                    log.warn(f'deleting file for download {id} failed with error message {e!r}')
-                if self.config.ARCHIVE_FILE:
+                    log.warning(f'deleting file for download {id} failed with error message {e!r}')
+                if self.config.ARCHIVE_FILE and getattr(dl.info, 'extractor', None):
                     with open(self.config.ARCHIVE_FILE, "r+") as file:
                         data = file.readlines()
                         file.seek(0)

@@ -3,7 +3,12 @@
 ![Build Status](https://github.com/alexta69/metube/actions/workflows/main.yml/badge.svg)
 ![Docker Pulls](https://img.shields.io/docker/pulls/alexta69/metube.svg)
 
-Web GUI for youtube-dl (using the [yt-dlp](https://github.com/yt-dlp/yt-dlp) fork) with playlist support. Allows you to download videos from YouTube and [dozens of other sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
+MeTube is a self-hosted web UI for `yt-dlp`, for downloading media from YouTube and [dozens of other sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
+
+Key capabilities:
+* Download videos, audio, captions, and thumbnails from a browser UI.
+* Download playlists and channels, with configurable output and download options.
+* Subscribe to channels and playlists, periodically check for new items, and queue new uploads automatically.
 
 ![screenshot1](https://github.com/alexta69/metube/raw/master/screenshot.gif)
 
@@ -36,6 +41,9 @@ Certain values can be set via environment variables, using the `-e` parameter on
 * __MAX_CONCURRENT_DOWNLOADS__: Maximum number of simultaneous downloads allowed. For example, if set to `5`, then at most five downloads will run concurrently, and any additional downloads will wait until one of the active downloads completes. Defaults to `3`. 
 * __DELETE_FILE_ON_TRASHCAN__: if `true`, downloaded files are deleted on the server, when they are trashed from the "Completed" section of the UI. Defaults to `false`.
 * __DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT__: Maximum number of playlist items that can be downloaded. Defaults to `0` (no limit).
+* __SUBSCRIPTION_DEFAULT_CHECK_INTERVAL__: Default minutes between automatic checks for each subscription. Defaults to `60`.
+* __SUBSCRIPTION_SCAN_PLAYLIST_END__: Maximum playlist/channel entries to fetch per subscription check (newest-first). Defaults to `50`.
+* __SUBSCRIPTION_MAX_SEEN_IDS__: Cap on stored video IDs per subscription to limit state file growth. Defaults to `50000`.
 * __CLEAR_COMPLETED_AFTER__: Number of seconds after which completed (and failed) downloads are automatically removed from the "Completed" list. Defaults to `0` (disabled).
 
 ### 📁 Storage & Directories
@@ -46,7 +54,7 @@ Certain values can be set via environment variables, using the `-e` parameter on
 * __CREATE_CUSTOM_DIRS__: Whether to support automatically creating directories within the __DOWNLOAD_DIR__ (or __AUDIO_DOWNLOAD_DIR__) if they do not exist. When enabled, the download directory selector supports free-text input, and the specified directory will be created recursively. Defaults to `true`.
 * __CUSTOM_DIRS_EXCLUDE_REGEX__: Regular expression to exclude some custom directories from the dropdown. Empty regex disables exclusion. Defaults to `(^|/)[.@].*$`, which means directories starting with `.` or `@`.
 * __DOWNLOAD_DIRS_INDEXABLE__: If `true`, the download directories (__DOWNLOAD_DIR__ and __AUDIO_DOWNLOAD_DIR__) are indexable on the web server. Defaults to `false`.
-* __STATE_DIR__: Path to where the queue persistence files will be saved. Defaults to `/downloads/.metube` in the Docker image, and `.` otherwise.
+* __STATE_DIR__: Path to where MeTube will store its persistent state files (`queue.json`, `pending.json`, `completed.json`, `subscriptions.json`). Defaults to `/downloads/.metube` in the Docker image, and `.` otherwise.
 * __TEMP_DIR__: Path where intermediary download files will be saved. Defaults to `/downloads` in the Docker image, and `.` otherwise.
   * Set this to an SSD or RAM filesystem (e.g., `tmpfs`) for better performance.
   * __Note__: Using a RAM filesystem may prevent downloads from being resumed.
@@ -60,8 +68,11 @@ Certain values can be set via environment variables, using the `-e` parameter on
 * __OUTPUT_TEMPLATE_CHAPTER__: The template for the filenames of the downloaded videos when split into chapters via postprocessors. Defaults to `%(title)s - %(section_number)s %(section_title)s.%(ext)s`.
 * __OUTPUT_TEMPLATE_PLAYLIST__: The template for the filenames of the downloaded videos when downloaded as a playlist. Defaults to `%(playlist_title)s/%(title)s.%(ext)s`. Set to empty to use `OUTPUT_TEMPLATE` instead.
 * __OUTPUT_TEMPLATE_CHANNEL__: The template for the filenames of the downloaded videos when downloaded as a channel. Defaults to `%(channel)s/%(title)s.%(ext)s`. Set to empty to use `OUTPUT_TEMPLATE` instead.
-* __YTDL_OPTIONS__: Additional options to pass to yt-dlp in JSON format. [See available options here](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/YoutubeDL.py#L222). They roughly correspond to command-line options, though some do not have exact equivalents here. For example, `--recode-video` has to be specified via `postprocessors`. Also note that dashes are replaced with underscores. You may find [this script](https://github.com/yt-dlp/yt-dlp/blob/master/devscripts/cli_to_api.py) helpful for converting from command-line options to `YTDL_OPTIONS`.
-* __YTDL_OPTIONS_FILE__: A path to a JSON file that will be loaded and used for populating `YTDL_OPTIONS` above. Please note that if both `YTDL_OPTIONS_FILE` and `YTDL_OPTIONS` are specified, the options in `YTDL_OPTIONS` take precedence. The file will be monitored for changes and reloaded automatically when changes are detected.
+* __YTDL_OPTIONS__: Additional options to pass to yt-dlp, as a JSON object. See [Configuring yt-dlp options](#%EF%B8%8F-configuring-yt-dlp-options) for details, examples, and available options reference.
+* __YTDL_OPTIONS_FILE__: Path to a JSON file containing yt-dlp options. Monitored and reloaded automatically on changes. See [Configuring yt-dlp options](#%EF%B8%8F-configuring-yt-dlp-options).
+* __YTDL_OPTIONS_PRESETS__: Named bundles of yt-dlp options, selectable per download in the UI. See [Configuring yt-dlp options](#%EF%B8%8F-configuring-yt-dlp-options) for format and examples.
+* __YTDL_OPTIONS_PRESETS_FILE__: Path to a JSON file containing presets. Monitored and reloaded automatically on changes. See [Configuring yt-dlp options](#%EF%B8%8F-configuring-yt-dlp-options).
+* __ALLOW_YTDL_OPTIONS_OVERRIDES__: Whether to show a free-text field in the UI for per-download yt-dlp option overrides. Defaults to `false`. See [Configuring yt-dlp options](#%EF%B8%8F-configuring-yt-dlp-options) for details and security considerations.
 
 ### 🌐 Web Server & URLs
 
@@ -73,6 +84,7 @@ Certain values can be set via environment variables, using the `-e` parameter on
 * __HTTPS__: Use `https` instead of `http` (__CERTFILE__ and __KEYFILE__ required). Defaults to `false`.
 * __CERTFILE__: HTTPS certificate file path.
 * __KEYFILE__: HTTPS key file path.
+* __CORS_ALLOWED_ORIGINS__: Comma-separated list of origins permitted to make cross-origin requests to the MeTube API. When unset or empty, all cross-origin requests are denied. This must be configured for [bookmarklets](#-bookmarklet) and any other browser-based tools that contact MeTube from a different origin. Example: `https://www.youtube.com,https://www.vimeo.com`.
 * __ROBOTS_TXT__: A path to a `robots.txt` file mounted in the container.
 
 ### 🏠 Basic Setup
@@ -83,6 +95,120 @@ Certain values can be set via environment variables, using the `-e` parameter on
 * __DEFAULT_THEME__: Default theme to use for the UI, can be set to `light`, `dark`, or `auto`. Defaults to `auto`.
 * __LOGLEVEL__: Log level, can be set to `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, or `NONE`. Defaults to `INFO`. 
 * __ENABLE_ACCESSLOG__: Whether to enable access log. Defaults to `false`.
+
+## 🎛️ Configuring yt-dlp options
+
+MeTube lets you customize how [yt-dlp](https://github.com/yt-dlp/yt-dlp) behaves at three levels, from broadest to most specific:
+
+1. **Global options** — apply to every download by default.
+2. **Presets** — named bundles of options that users can pick per download from the UI.
+3. **Per-download overrides** — free-form options entered in the UI for a single download.
+
+When a download starts, these layers are combined in order. If the same option appears in more than one layer, the more specific one wins: per-download overrides beat presets, and presets beat global options.
+
+### Option format
+
+yt-dlp options in MeTube are expressed as JSON objects. The keys are yt-dlp API option names, which roughly correspond to command-line flags with dashes replaced by underscores. For example, the command-line flag `--embed-thumbnail` becomes `"embed_thumbnail": true` in JSON.
+
+> **Tip:** Some command-line flags don't have a direct single-key equivalent — for instance, `--recode-video` must be expressed via `"postprocessors"`. A full list of available API options can be found [in the yt-dlp source](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/YoutubeDL.py#L224), and [this conversion script](https://github.com/yt-dlp/yt-dlp/blob/master/devscripts/cli_to_api.py) can help translate command-line flags to their API equivalents.
+
+### Global options
+
+Global options form the baseline for every download. There are two ways to define them, and you can use either or both:
+
+**Inline via environment variable** (`YTDL_OPTIONS`) — pass a JSON object directly:
+
+```yaml
+environment:
+  - 'YTDL_OPTIONS={"writesubtitles": true, "subtitleslangs": ["en", "de"], "updatetime": false, "embed_thumbnail": true}'
+```
+
+**Via a JSON file** (`YTDL_OPTIONS_FILE`) — mount a file into the container and point to it:
+
+```yaml
+volumes:
+  - /path/to/ytdl-options.json:/config/ytdl-options.json
+environment:
+  - YTDL_OPTIONS_FILE=/config/ytdl-options.json
+```
+
+where `ytdl-options.json` contains:
+
+```json
+{
+  "writesubtitles": true,
+  "subtitleslangs": ["en", "de"],
+  "updatetime": false,
+  "embed_thumbnail": true
+}
+```
+
+The file is monitored for changes and reloaded automatically — no container restart needed. If you use both methods and they define the same key, the **file takes precedence**.
+
+### Presets
+
+Presets let you define named bundles of options that appear in the web UI under **Advanced Options** as "Option Presets". Users can select one or more presets per download, making it easy to apply common option combinations without editing global settings.
+
+Like global options, presets can be set inline or via a file:
+
+* `YTDL_OPTIONS_PRESETS` — a JSON object where each key is a preset name and its value is a set of yt-dlp options.
+* `YTDL_OPTIONS_PRESETS_FILE` — path to a JSON file containing presets, monitored and reloaded on changes.
+
+If both are used and they define a preset with the same name, the **file's version takes precedence**.
+
+**Example** — a presets file defining three presets:
+
+```json
+{
+  "sponsorblock": {
+    "postprocessors": [
+      { "key": "SponsorBlock", "categories": ["sponsor", "selfpromo", "interaction"] },
+      { "key": "ModifyChapters", "remove_sponsor_segments": ["sponsor", "selfpromo", "interaction"] }
+    ]
+  },
+  "embed-subs": {
+    "writesubtitles": true,
+    "writeautomaticsub": true,
+    "subtitleslangs": ["en", "de"],
+    "postprocessors": [{ "key": "FFmpegEmbedSubtitle" }]
+  },
+  "limit-rate": {
+    "ratelimit": 5000000
+  }
+}
+```
+
+This makes three presets available in the UI:
+* **sponsorblock** — strips sponsor, self-promo, and interaction segments from videos.
+* **embed-subs** — downloads English and German subtitles and embeds them into the video file.
+* **limit-rate** — caps download speed to ~5 MB/s.
+
+When multiple presets are selected for a download, they are applied in order. If two presets set the same option, the later one wins.
+
+### Per-download overrides
+
+For one-off tweaks, MeTube can expose a free-text JSON field in the UI ("Custom yt-dlp Options") where users type yt-dlp options that apply only to that single download. This is disabled by default:
+
+```yaml
+environment:
+  - ALLOW_YTDL_OPTIONS_OVERRIDES=true
+```
+
+Once enabled, the field appears under **Advanced Options**. Any options entered there take the highest priority, overriding both global options and selected presets.
+
+> **⚠️ Security note:** Enabling this allows arbitrary yt-dlp API options to be supplied by anyone with access to the UI. Depending on the options used, this may enable arbitrary command execution inside the container. Enable only in trusted environments.
+
+### How the layers combine
+
+When a download starts, the final set of yt-dlp options is built in this order:
+
+1. Start with **global options** (`YTDL_OPTIONS` / `YTDL_OPTIONS_FILE`).
+2. Apply each selected **preset** in order (later presets overwrite earlier ones for conflicting keys).
+3. Apply any **per-download overrides** on top (overwrite everything else for conflicting keys).
+
+**Example:** Suppose your global options set `"writesubtitles": false`, but you select a preset that sets `"writesubtitles": true`. Subtitles will be written for that download because the preset overrides the global setting. If you additionally enter `{"writesubtitles": false}` in the per-download overrides field, that value wins and subtitles will not be written.
+
+### Configuration cookbooks
 
 The project's Wiki contains examples of useful configurations contributed by users of MeTube:
 * [YTDL_OPTIONS Cookbook](https://github.com/alexta69/metube/wiki/YTDL_OPTIONS-Cookbook)
@@ -112,20 +238,11 @@ __Firefox:__ contributed by [nanocortex](https://github.com/nanocortex). You can
 
 [rithask](https://github.com/rithask) created an iOS shortcut to send URLs to MeTube from Safari. Enter the MeTube instance address when prompted which will be saved for later use. You can run the shortcut from Safari’s share menu. The shortcut can be downloaded from [this iCloud link](https://www.icloud.com/shortcuts/66627a9f334c467baabdb2769763a1a6).
 
-## 📱 iOS Compatibility
-
-iOS has strict requirements for video files, requiring h264 or h265 video codec and aac audio codec in MP4 container. This can sometimes be a lower quality than the best quality available. To accommodate iOS requirements, when downloading a MP4 format you can choose "Best (iOS)" to get the best quality formats as compatible as possible with iOS requirements.
-
-To force all downloads to be converted to an iOS-compatible codec, insert this as an environment variable: 
-
-```yaml
-  environment:
-    - 'YTDL_OPTIONS={"format": "best", "exec": "ffmpeg -i %(filepath)q -c:v libx264 -c:a aac %(filepath)q.h264.mp4"}'
-```
-
 ## 🔖 Bookmarklet
 
 [kushfest](https://github.com/kushfest) has created a Chrome bookmarklet for sending the currently open webpage to MeTube. Please note that if you're on an HTTPS page, your MeTube instance must be configured with `HTTPS` as `true` in the environment, or be behind an HTTPS reverse proxy (see below) for the bookmarklet to work.
+
+Since bookmarklets run in the context of the current page (e.g. youtube.com), the requests they make to MeTube are cross-origin. You must add the origins of sites where you use the bookmarklet to the __CORS_ALLOWED_ORIGINS__ environment variable, otherwise the browser will block the requests. For example, to use the bookmarklet on YouTube and Vimeo: `CORS_ALLOWED_ORIGINS=https://www.youtube.com,https://www.vimeo.com`.
 
 GitHub doesn't allow embedding JavaScript as a link, so the bookmarklet has to be created manually by copying the following code to a new bookmark you create on your bookmarks bar. Change the hostname in the URL below to point to your MeTube instance.
 
